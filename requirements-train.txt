@@ -1,0 +1,13 @@
+# Tarjuman — TRAINING-ONLY dependencies (1D-CNN path)
+#
+# Deliberately separate from requirements.txt: the Raspberry Pi runs inference
+# through onnxruntime alone and must never pull in PyTorch (~2 GB).
+#
+# Install on the development machine only:
+#     pip install -r requirements.txt -r requirements-train.txt
+#
+# CPU-only build is sufficient — this dataset trains in seconds. For the much
+# smaller CPU wheel use:
+#     pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+torch>=2.2

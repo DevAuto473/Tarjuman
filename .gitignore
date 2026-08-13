@@ -1,0 +1,28 @@
+# ── Secrets — NEVER commit ───────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Python ───────────────────────────────────────────────────────────────────
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ── Node ─────────────────────────────────────────────────────────────────────
+node_modules/
+
+# ── Rust / Tauri build output ────────────────────────────────────────────────
+tarjuman/src-tauri/target/
+
+# ── Models / datasets / generated artifacts ──────────────────────────────────
+*.pkl
+*.onnx
+*.bak
+confusion_matrix.png
+
+# ── OS / editor ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

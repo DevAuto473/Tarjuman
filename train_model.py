@@ -1,0 +1,489 @@
+"""
+train_model.py — Advanced ML Training Pipeline for Tarjuman
+=============================================================
+Trains a lightweight RandomForestClassifier on dynamic gesture sequences
+(30 frames × 300 landmarks = 9 000 features per sample) and exports the
+trained pipeline to ONNX format for high-performance inference on a
+Raspberry Pi.
+
+Pipeline overview
+-----------------
+  1. Load  `dynamic_gestures.csv`  (col 0 = label, cols 1–9000 = features)
+  2. Encode string labels → integers with LabelEncoder
+  3. Split 80 / 20 stratified train / test
+  4. Augment training data with Gaussian jitter (simulates hand tremor)
+  5. Build  StandardScaler → RandomForest(150 trees, depth 20)
+  6. Evaluate: accuracy, classification report, confusion matrix PNG
+  7. Export: sign_model.onnx  +  labels.json
+"""
+
+import json
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")                       # headless backend — no GUI needed
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+
+from skl2onnx import convert_sklearn
+from skl2onnx.common.data_types import FloatTensorType
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+INPUT_CSV       = os.environ.get("TARJUMAN_CSV", "dynamic_gestures_v4.csv")
+PKL_MODEL_PATH  = "sign_model.pkl"     # dev / inspection only
+ONNX_MODEL_PATH = "sign_model.onnx"    # production artifact used by the server
+LABELS_JSON     = "labels.json"
+CM_IMAGE        = "confusion_matrix.png"
+
+# Model hyper-parameters
+N_ESTIMATORS = 150
+MAX_DEPTH    = 20
+RANDOM_STATE = 42
+
+# ── Augmentation ─────────────────────────────────────────────────────────────
+NOISE_STDDEV = 0.005          # Gaussian jitter σ  (relative to landmark scale ≈ 0–1)
+
+# Temporal augmentation — simulates the SAME sign performed at different speeds.
+# Without this the model only ever sees gestures at the exact pace they were
+# recorded, which in practice forces users to sign unnaturally slowly to be
+# recognised. Combined with gesture_segmenter.resample_sequence(), this is what
+# makes signing speed stop mattering.
+TIME_WARP_FACTORS = (0.7, 1.4)   # 30 % faster … 40 % slower
+FRAME_DROPOUT_P   = 0.10         # probability a frame is dropped, then re-filled
+
+# Data geometry — imported, never redeclared (see feature_extractor.py)
+from feature_extractor import (
+    FRAME_FEATURES, N_GLOBAL_FEATURES, SEQUENCE_LENGTH, TOTAL_FEATURES, VALS_PER_FRAME,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Helper: Gaussian noise augmentation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def augment_with_jitter(X: np.ndarray, y: np.ndarray,
+                        noise_std: float = NOISE_STDDEV) -> tuple:
+    """
+    Create one synthetic copy of every training sample by adding
+    small Gaussian noise (jitter) to simulate slight hand tremors
+    or different spatial positions.
+
+    Parameters
+    ----------
+    X : ndarray, shape (n_samples, n_features)
+    y : ndarray, shape (n_samples,)
+    noise_std : float
+        Standard deviation of the additive Gaussian noise.
+
+    Returns
+    -------
+    X_aug : ndarray — original + synthetic rows stacked
+    y_aug : ndarray — labels duplicated accordingly
+    """
+    rng = np.random.default_rng(seed=RANDOM_STATE)
+    noise = rng.normal(loc=0.0, scale=noise_std, size=X.shape).astype(X.dtype)
+    X_synthetic = X + noise
+
+    X_aug = np.vstack([X, X_synthetic])
+    y_aug = np.concatenate([y, y])
+    return X_aug, y_aug
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Helper: temporal augmentation (speed invariance)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _split_blocks(X: np.ndarray):
+    """
+    Separate the per-frame block from the global block.
+
+    Augmentation must NEVER touch the globals: they encode duration, tempo and
+    direction, which is precisely the information some signs depend on. Warping
+    them would teach the model to ignore the very thing that separates
+    طوارئ from a calm wave.
+    """
+    frames = X[:, :FRAME_FEATURES].reshape(-1, SEQUENCE_LENGTH, VALS_PER_FRAME)
+    globals_ = X[:, FRAME_FEATURES:]
+    return frames, globals_
+
+
+def _join_blocks(frames: np.ndarray, globals_: np.ndarray) -> np.ndarray:
+    """Inverse of _split_blocks."""
+    return np.hstack([frames.reshape(frames.shape[0], -1), globals_])
+
+
+def _resample(seq: np.ndarray, target_len: int = SEQUENCE_LENGTH) -> np.ndarray:
+    """Linearly resample one (T, VALS_PER_FRAME) sequence to target_len frames.
+
+    Mirrors gesture_segmenter.resample_sequence() so training-time warping and
+    run-time segmentation speak the same language.
+    """
+    if seq.shape[0] == target_len:
+        return seq.astype(np.float32)
+
+    src = np.linspace(0.0, 1.0, num=seq.shape[0])
+    dst = np.linspace(0.0, 1.0, num=target_len)
+    out = np.empty((target_len, seq.shape[1]), dtype=np.float32)
+    for col in range(seq.shape[1]):
+        out[:, col] = np.interp(dst, src, seq[:, col])
+    return out
+
+
+def augment_time_warp(X: np.ndarray, y: np.ndarray, rng,
+                      speed_critical_mask=None) -> tuple:
+    """
+    Create one speed-warped copy of every sample.
+
+    A random factor stretches or compresses the sequence in time, then it is
+    resampled back to SEQUENCE_LENGTH — exactly what happens at inference when
+    a signer performs the same sign faster or slower than the training take.
+
+    `speed_critical_mask` marks samples whose CLASS is defined by its tempo
+    (طوارئ, إسعاف, ساعدني فوراً). Those are warped far more gently: teaching
+    full speed-invariance on them would erase the only thing distinguishing
+    them from their calm counterparts.
+    """
+    frames, globals_ = _split_blocks(X)
+    warped = np.empty_like(frames)
+
+    lo, hi = TIME_WARP_FACTORS
+    for i, seq in enumerate(frames):
+        if speed_critical_mask is not None and speed_critical_mask[i]:
+            factor = rng.uniform(0.92, 1.08)      # gentle: keep tempo meaningful
+        else:
+            factor = rng.uniform(lo, hi)
+        stretched_len = max(4, int(round(SEQUENCE_LENGTH * factor)))
+        stretched = _resample(seq, stretched_len)            # change the pace…
+        warped[i] = _resample(stretched, SEQUENCE_LENGTH)    # …then re-normalise
+
+    # Globals pass through untouched — see _split_blocks.
+    return _join_blocks(warped, globals_.copy()), y.copy()
+
+
+def augment_frame_dropout(X: np.ndarray, y: np.ndarray, rng) -> tuple:
+    """
+    Create one copy with random frames dropped and the gap resampled shut.
+
+    Simulates dropped frames on a loaded Raspberry Pi and small stutters in the
+    signer's movement, so the model does not depend on any single frame.
+    """
+    frames, globals_ = _split_blocks(X)
+    out = np.empty_like(frames)
+
+    for i, seq in enumerate(frames):
+        keep = rng.random(SEQUENCE_LENGTH) > FRAME_DROPOUT_P
+        if keep.sum() < 4:            # never drop almost everything
+            keep[:] = True
+        out[i] = _resample(seq[keep], SEQUENCE_LENGTH)
+
+    return _join_blocks(out, globals_.copy()), y.copy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Helper: Pretty confusion-matrix heatmap
+# ─────────────────────────────────────────────────────────────────────────────
+
+def report_confusions(y_true, y_pred, class_names, top_n: int = 12) -> None:
+    """
+    List the class pairs the model actually mixes up, worst first.
+
+    Ranked by combined count in BOTH directions, since a genuinely ambiguous
+    pair confuses symmetrically while a one-way error usually means one class
+    is simply under-represented.
+    """
+    cm = confusion_matrix(y_true, y_pred)
+    n = len(class_names)
+
+    pairs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            both = int(cm[i, j] + cm[j, i])
+            if both:
+                support = int(cm[i].sum() + cm[j].sum())
+                pairs.append((both, support, class_names[i], class_names[j]))
+
+    print("\n   Most-confused pairs:")
+    if not pairs:
+        print("       No confusions between classes.")
+        return
+
+    pairs.sort(reverse=True)
+    for both, support, a, b in pairs[:top_n]:
+        rate = both / support * 100 if support else 0.0
+        print(f"       {a}  ↔  {b}   —  {both} errors ({rate:.0f}% of their samples)")
+
+    if len(pairs) > top_n:
+        print(f"       ... and {len(pairs) - top_n} more pairs")
+    print("       -> record more samples for these, or redesign the sign.")
+
+
+def save_confusion_matrix(y_true, y_pred, class_names, path: str):
+    """
+    Build and save a publication-quality confusion-matrix heatmap.
+    Uses a modern dark colour palette for maximum readability.
+    """
+    cm = confusion_matrix(y_true, y_pred)
+
+    fig, ax = plt.subplots(figsize=(max(8, len(class_names) * 0.75),
+                                    max(6, len(class_names) * 0.65)))
+
+    sns.set_theme(style="darkgrid")
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="YlOrRd",
+        xticklabels=class_names,
+        yticklabels=class_names,
+        linewidths=0.6,
+        linecolor="#333333",
+        cbar_kws={"shrink": 0.8, "label": "Samples"},
+        ax=ax,
+    )
+
+    ax.set_xlabel("Predicted Label", fontsize=12, fontweight="bold")
+    ax.set_ylabel("True Label",      fontsize=12, fontweight="bold")
+    ax.set_title("Tarjuman — Gesture Classification Confusion Matrix",
+                 fontsize=14, fontweight="bold", pad=14)
+
+    plt.xticks(rotation=45, ha="right", fontsize=9)
+    plt.yticks(rotation=0, fontsize=9)
+    plt.tight_layout()
+
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    print(f"   [OK] confusion matrix saved -> {path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Main pipeline
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    t0 = time.perf_counter()
+    print("=" * 65)
+    print("   Tarjuman - Dynamic Gesture Training Pipeline")
+    print("=" * 65)
+
+    # ── Step 1: Load CSV ────────────────────────────────────────────────────
+    print("\n[1/7] Loading data from", INPUT_CSV)
+
+    if not os.path.isfile(INPUT_CSV):
+        print(f"\n[FAIL] File not found:")
+        print("        Run data_collector.py first to record samples.")
+        sys.exit(1)
+
+    df = pd.read_csv(INPUT_CSV)
+
+    # Validate shape
+    expected_cols = TOTAL_FEATURES + 1      # label + 9 000 features
+    if df.shape[1] != expected_cols:
+        print(f"\n[WARN] Column count ({df.shape[1]}) != expected ({expected_cols}).")
+        print("       Continuing with the data as-is.")
+
+    labels_raw = df.iloc[:, 0].values       # first column  → labels
+    features   = df.iloc[:, 1:].values      # remaining cols → float features
+
+    print(f"   samples      : {len(df):,}")
+    print(f"   columns      : {df.shape[1]:,}  (1 label + {df.shape[1] - 1} features)")
+    print(f"   classes      : {np.unique(labels_raw).tolist()}")
+
+    # ── Step 2: Encode labels ───────────────────────────────────────────────
+    print("\n[2/7] Encoding labels (LabelEncoder)")
+    le = LabelEncoder()
+    y = le.fit_transform(labels_raw)
+    class_names = le.classes_.tolist()
+    print(f"   └─  {len(class_names)} classes -> {class_names}")
+
+    # ── Step 3: Train / test split ──────────────────────────────────────────
+    print("\n[3/7] Train/test split (80% / 20%)")
+    X_train, X_test, y_train, y_test = train_test_split(
+        features, y,
+        test_size=0.2,
+        random_state=RANDOM_STATE,
+        stratify=y,
+    )
+    print(f"   train : {X_train.shape[0]:,} samples")
+    print(f"   test  : {X_test.shape[0]:,} samples")
+
+    # ── Step 4: Data augmentation ───────────────────────────────────────────
+    print(f"\n[4/7] Augmentation (spatial + temporal)")
+    original_count = X_train.shape[0]
+    rng = np.random.default_rng(seed=RANDOM_STATE)
+
+    X_base, y_base = X_train, y_train
+
+    # a) Spatial: Gaussian jitter — hand tremor / slight position differences
+    X_jit, y_jit = augment_with_jitter(X_base, y_base)
+    X_jit, y_jit = X_jit[original_count:], y_jit[original_count:]   # synthetic half only
+    print(f"   gaussian jitter (sigma={NOISE_STDDEV}) : +{X_jit.shape[0]:,}")
+
+    # b) Temporal: speed warping — the SAME sign performed faster / slower.
+    #    Signs whose meaning IS their tempo are warped only gently.
+    try:
+        from vocabulary import as_dicts
+        speed_ids = {e["id"] for e in as_dicts() if e["speed_critical"]}
+    except Exception:
+        speed_ids = set()
+    speed_mask = np.array([class_names[i] in speed_ids for i in y_base])
+    if speed_mask.any():
+        print(f"   speed-critical samples protected from warping: {int(speed_mask.sum())} samples")
+
+    X_warp, y_warp = augment_time_warp(X_base, y_base, rng, speed_mask)
+    print(f"   time warp {TIME_WARP_FACTORS}              : +{X_warp.shape[0]:,}")
+
+    # c) Temporal: frame dropout — dropped frames / movement stutter
+    X_drop, y_drop = augment_frame_dropout(X_base, y_base, rng)
+    print(f"   frame dropout (p={FRAME_DROPOUT_P})        : +{X_drop.shape[0]:,}")
+
+    X_train = np.vstack([X_base, X_jit, X_warp, X_drop])
+    y_train = np.concatenate([y_base, y_jit, y_warp, y_drop])
+
+    print(f"   original         : {original_count:,}")
+    print(f"   total            : {X_train.shape[0]:,}  "
+          f"(×{X_train.shape[0] / max(original_count, 1):.0f})")
+
+    # ── Step 5: Build & train pipeline ──────────────────────────────────────
+    print(f"\n[5/7] Building and training the pipeline")
+    print(f"         StandardScaler → RandomForest(n={N_ESTIMATORS}, depth={MAX_DEPTH})")
+
+    pipeline = Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf",    RandomForestClassifier(
+                       n_estimators=N_ESTIMATORS,
+                       max_depth=MAX_DEPTH,
+                       random_state=RANDOM_STATE,
+                       n_jobs=-1,
+                   )),
+    ])
+
+    t_train = time.perf_counter()
+    pipeline.fit(X_train, y_train)
+    elapsed_train = time.perf_counter() - t_train
+    print(f"   trained in {elapsed_train:.1f}s")
+
+    # ── Step 6: Evaluate ────────────────────────────────────────────────────
+    print("\n[6/7] Evaluating on the held-out test set")
+    y_pred   = pipeline.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+
+    print(f"\n   accuracy : {accuracy * 100:.2f} %\n")
+    print(classification_report(
+        y_test, y_pred,
+        target_names=class_names,
+        zero_division=0,
+    ))
+
+    # Confusion matrix → PNG
+    save_confusion_matrix(y_test, y_pred, class_names, CM_IMAGE)
+
+    # ── Which pairs actually get confused? ──────────────────────────────────
+    # A single accuracy number hides the thing that matters most here: WHICH
+    # signs the model mixes up. With a vocabulary full of near-identical
+    # gestures, the confusable pairs are the whole story — they tell you which
+    # signs need redesigning or more samples, instead of guessing.
+    report_confusions(y_test, y_pred, class_names)
+
+    # ── Step 7: Export ONNX (production) + PKL (dev) + labels.json ─────────
+    print(f"\n[7/7] Exporting ONNX + PKL + labels.json")
+
+    # ── 7a. PKL — kept for local inspection/debugging only ─────────────────
+    import pickle
+    with open(PKL_MODEL_PATH, "wb") as f:
+        pickle.dump(pipeline, f)
+
+    pkl_size = os.path.getsize(PKL_MODEL_PATH) / (1024 * 1024)
+    print(f"   [OK] {PKL_MODEL_PATH}  ({pkl_size:.1f} MB)  (development only)")
+
+    # ── 7b. ONNX — the artifact the server actually runs ───────────────────
+    # Why ONNX: sklearn's predict_proba carries heavy Python/joblib overhead
+    # per call (~22.7 ms/frame measured). ONNX Runtime executes the same forest
+    # as a single compiled TreeEnsemble op (~0.04 ms/frame) — a ~546× speedup,
+    # which matters enormously on a Raspberry Pi.
+    #
+    # zipmap=False is CRITICAL: without it the probabilities output is a list
+    # of dicts (ZipMap), which is slow to build and awkward to consume.
+    # With it, we get a clean (N, n_classes) float32 array.
+    #
+    # Batch dimension is None so the same file works for single-frame
+    # inference (server) and batched evaluation (offline testing).
+    initial_type = [("input", FloatTensorType([None, TOTAL_FEATURES]))]
+    onnx_model = convert_sklearn(
+        pipeline,
+        initial_types=initial_type,
+        options={"clf": {"zipmap": False}},
+    )
+    with open(ONNX_MODEL_PATH, "wb") as f:
+        f.write(onnx_model.SerializeToString())
+
+    onnx_size = os.path.getsize(ONNX_MODEL_PATH) / (1024 * 1024)
+    print(f"   [OK] {ONNX_MODEL_PATH}  ({onnx_size:.1f} MB)  (production)")
+
+    # ── 7c. Verify ONNX output matches sklearn before trusting it ──────────
+    # A silent numerical divergence here would be very hard to debug later,
+    # so we assert parity on the held-out test set at export time.
+    try:
+        import onnxruntime as ort
+
+        sess = ort.InferenceSession(
+            ONNX_MODEL_PATH, providers=["CPUExecutionProvider"]
+        )
+        in_name   = sess.get_inputs()[0].name
+        prob_name = sess.get_outputs()[1].name      # [0]=label, [1]=probabilities
+
+        proba_sklearn = pipeline.predict_proba(X_test)
+        proba_onnx    = sess.run([prob_name], {in_name: X_test.astype(np.float32)})[0]
+
+        max_diff  = float(np.abs(proba_sklearn - proba_onnx).max())
+        agreement = float((proba_sklearn.argmax(1) == proba_onnx.argmax(1)).mean())
+
+        print(f"   Parity check against scikit-learn:")
+        print(f"     max prob diff  : {max_diff:.2e}")
+        print(f"     agreement      : {agreement * 100:.2f} %")
+
+        if agreement < 1.0:
+            print("   [WARN] ONNX does not match scikit-learn 100% - review before deploying.")
+    except ImportError:
+        print("   [WARN] onnxruntime not installed - parity check skipped.")
+
+    # ── 7d. Class mapping  { "0": "Alef", "1": "Beh", … } ──────────────────
+    # LabelEncoder guarantees integer classes 0..n-1 in sorted order, so the
+    # column index of the ONNX probabilities output maps directly to this key.
+    label_map = {str(i): name for i, name in enumerate(class_names)}
+    with open(LABELS_JSON, "w", encoding="utf-8") as f:
+        json.dump(label_map, f, ensure_ascii=False, indent=2)
+    print(f"   [OK] {LABELS_JSON}  ({len(label_map)} classes)")
+
+    # ── Done ────────────────────────────────────────────────────────────────
+    total = time.perf_counter() - t0
+    print("\n" + "=" * 65)
+    print(f"   Done in {total:.1f}s")
+    print(f"     ONNX model   : {ONNX_MODEL_PATH}   <- used by the server")
+    print(f"     PKL model    : {PKL_MODEL_PATH}    <- dev only")
+    print(f"     label map    : {LABELS_JSON}")
+    print(f"     confusion    : {CM_IMAGE}")
+    print("=" * 65)
+
+
+if __name__ == "__main__":
+    main()

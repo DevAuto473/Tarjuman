@@ -1,0 +1,25 @@
+{
+  "name": "tarjuman-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Dev orchestration for Tarjuman: Python backend + Tauri frontend.",
+  "scripts": {
+    "dev:server": "node scripts/run-python.mjs websocket_server.py",
+    "dev:app": "wait-on tcp:127.0.0.1:8765 && npm --prefix tarjuman run tauri dev",
+    "dev:web": "wait-on tcp:127.0.0.1:8765 && npm --prefix tarjuman run dev",
+    "dev:all": "concurrently --names \"backend,app\" --prefix-colors \"cyan,magenta\" --kill-others-on-fail \"npm:dev:server\" \"npm:dev:app\"",
+    "dev:browser": "concurrently --names \"backend,web\" --prefix-colors \"cyan,green\" --kill-others-on-fail \"npm:dev:server\" \"npm:dev:web\"",
+    "build": "npm --prefix tarjuman run tauri build",
+    "collect": "node scripts/run-python.mjs data_collector.py",
+    "train": "node scripts/run-python.mjs train_model.py",
+    "migrate": "node scripts/run-python.mjs migrate_dataset.py",
+    "cameras": "node scripts/run-python.mjs list_cameras.py",
+    "sheet": "node scripts/run-python.mjs make_learn_sheet.py",
+    "check": "node scripts/run-python.mjs vocabulary.py"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.0",
+    "wait-on": "^9.0.10"
+  }
+}
