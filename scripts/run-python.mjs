@@ -79,12 +79,21 @@ if (NEEDS_ENV.has(scriptName) && !existsSync(join(projectRoot, '.env'))) {
 // ── Launch ───────────────────────────────────────────────────────────────────
 
 const { cmd, fromVenv } = resolvePython();
-console.log(`🐍  ${scriptName} → ${cmd}${fromVenv ? '' : '  (system Python)'}`);
+console.log(`[py] ${scriptName} → ${cmd}${fromVenv ? '' : '  (system Python)'}`);
 
 const child = spawn(cmd, [scriptPath, ...scriptArgs], {
   cwd: projectRoot,   // model / CSV / label files resolve relative to the root
   stdio: 'inherit',
-  env: { ...process.env, PYTHONUNBUFFERED: '1' }, // stream logs immediately
+  env: {
+    ...process.env,
+    PYTHONUNBUFFERED: '1',       // stream logs immediately
+    // Windows consoles default to a legacy code page (cp1252 / cp437 / cp1256)
+    // that cannot encode arrows, box-drawing characters or Arabic. Python then
+    // raises UnicodeEncodeError mid-print and the script dies part-way through
+    // its own progress output — which reads as "it printed nothing and made no
+    // files". 'replace' guarantees a substituted character instead of a crash.
+    PYTHONIOENCODING: 'utf-8:replace',
+  },
 });
 
 child.on('error', (err) => {
@@ -97,4 +106,9 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => child.kill(signal));
 }
 
-child.on('exit', (code) => process.exit(code ?? 0));
+child.on('exit', (code) => {
+  // Say so out loud. A silent non-zero exit is the hardest kind of failure to
+  // report, because there is nothing for the user to copy back.
+  if (code) console.error(`\n[FAIL] ${scriptName} exited with code ${code}`);
+  process.exit(code ?? 0);
+});

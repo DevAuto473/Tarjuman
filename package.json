@@ -8,15 +8,19 @@
     "dev:server": "node scripts/run-python.mjs websocket_server.py",
     "dev:app": "wait-on tcp:127.0.0.1:8765 && npm --prefix tarjuman run tauri dev",
     "dev:web": "wait-on tcp:127.0.0.1:8765 && npm --prefix tarjuman run dev",
-    "dev:all": "concurrently --names \"backend,app\" --prefix-colors \"cyan,magenta\" --kill-others-on-fail \"npm:dev:server\" \"npm:dev:app\"",
-    "dev:browser": "concurrently --names \"backend,web\" --prefix-colors \"cyan,green\" --kill-others-on-fail \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:all": "concurrently --handle-input --default-input-target 0 --names \"backend,app\" --prefix-colors \"cyan,magenta\" --kill-others-on-fail \"npm:dev:server\" \"npm:dev:app\"",
+    "dev:browser": "concurrently --handle-input --default-input-target 0 --names \"backend,web\" --prefix-colors \"cyan,green\" --kill-others-on-fail \"npm:dev:server\" \"npm:dev:web\"",
     "build": "npm --prefix tarjuman run tauri build",
     "collect": "node scripts/run-python.mjs data_collector.py",
     "train": "node scripts/run-python.mjs train_model.py",
+    "test": "node scripts/run-python.mjs test_model.py",
     "migrate": "node scripts/run-python.mjs migrate_dataset.py",
     "cameras": "node scripts/run-python.mjs list_cameras.py",
     "sheet": "node scripts/run-python.mjs make_learn_sheet.py",
-    "check": "node scripts/run-python.mjs vocabulary.py"
+    "check": "node scripts/run-python.mjs vocabulary.py",
+    "export3d": "node scripts/run-python.mjs export_signs_3d.py",
+    "mirror": "node scripts/run-python.mjs mirror_test.py",
+    "doctor": "node scripts/run-python.mjs diagnose.py"
   },
   "devDependencies": {
     "concurrently": "^10.0.0",

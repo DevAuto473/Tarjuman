@@ -115,7 +115,7 @@ def main() -> int:
             " + ".join(warn), "",
         ])
 
-    # utf-8-sig → Excel on Windows renders the Arabic correctly
+    # utf-8-sig -> Excel on Windows renders the Arabic correctly
     try:
         with open(OUTPUT_CSV, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)

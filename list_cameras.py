@@ -35,9 +35,9 @@ os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_MSMF", "0")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Device names (Windows / DirectShow)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def device_names() -> list[str]:
     """
@@ -47,20 +47,16 @@ def device_names() -> list[str]:
     unambiguous, "index 2" is a guess. Requires pygrabber; if it is missing we
     degrade to resolution-based hints rather than failing.
     """
-    if not IS_WINDOWS:
-        return []
-    try:
-        from pygrabber.dshow_graph import FilterGraph
-        return FilterGraph().get_input_devices()
-    except ImportError:
-        return []
-    except Exception:
-        return []
+    # Shared with the pickers in camera_manager, so the name you choose from in
+    # this tool is the same name they show you.
+    from camera_manager import camera_device_names
+    names, _exact = camera_device_names()
+    return names
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Probing
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def open_capture(index: int):
     """
@@ -166,9 +162,9 @@ def preview(index: int, label: str) -> str | None:
     return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Client detection
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def installed_clients() -> list[str]:
     """Look for the PC clients that create a virtual camera."""
@@ -196,7 +192,7 @@ def main() -> int:
     print("  CAMERA DIAGNOSTIC")
     print("=" * 66)
 
-    # ── 1. PC clients ───────────────────────────────────────────────────────
+    # -- 1. PC clients -------------------------------------------------------
     clients = installed_clients()
     print("\n1) Virtual-camera clients installed:")
     if clients:
@@ -209,7 +205,7 @@ def main() -> int:
     else:
         print("     (skipped: not Windows)")
 
-    # ── 2. Device names ─────────────────────────────────────────────────────
+    # -- 2. Device names -----------------------------------------------------
     names = device_names()
     print("\n2) Device names reported by Windows:")
     if names:
@@ -221,7 +217,7 @@ def main() -> int:
     else:
         print("     (not available on this platform)")
 
-    # ── 3. Probe ────────────────────────────────────────────────────────────
+    # -- 3. Probe ------------------------------------------------------------
     print("\n3) Probing indices (a few seconds)...\n")
     results = probe(args.max)
     working = [r for r in results if r.get("frame")]
@@ -240,7 +236,7 @@ def main() -> int:
             print(f"     index {idx}: opened but sent no frames "
                   f"(in use by another app?)")
 
-    # ── 4. Verdict ──────────────────────────────────────────────────────────
+    # -- 4. Verdict ----------------------------------------------------------
     print("\n" + "=" * 66)
     if not working:
         print("  NO USABLE CAMERA FOUND")

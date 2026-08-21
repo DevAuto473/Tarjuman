@@ -19,7 +19,7 @@ The parameters are the classic sign-language ones (Stokoe): handshape,
 location, movement, orientation — plus how many hands. Two signs identical in
 all five are indistinguishable from landmarks, full stop.
 
-⚠️  What this file is NOT
+[!]  What this file is NOT
 -------------------------
 The WORD LIST is a usage judgement. The ATTRIBUTE values are engineering
 placeholders so collisions can be found BEFORE recording. They are not an
@@ -88,7 +88,7 @@ FIELDS = ("id", "arabic", "shape", "location", "motion", "orient", "hands", "spe
 
 # (id, arabic, shape, location, motion, orient, hands, speed_critical)
 VOCABULARY = [
-    # ── تحيّات ومجاملات ──────────────────────────────────────────────────────
+    # -- تحيّات ومجاملات ------------------------------------------------------
     ("salam",         "السلام عليكم", "flat",  "forehead",   "arc",       "fwd",  1, False),
     ("hello",         "أهلاً",         "open5", "shoulder",   "wave",      "fwd",  1, False),
     ("morning",       "صباح الخير",    "flat",  "neutral",    "up",        "up",   2, False),
@@ -100,7 +100,7 @@ VOCABULARY = [
     ("please",        "لو سمحت",       "flat",  "chest",      "circular",  "up",   1, False),
     ("welcome",       "تشرفنا",        "open5", "chest",      "open",      "up",   2, False),
 
-    # ── أسئلة ───────────────────────────────────────────────────────────────
+    # -- أسئلة ---------------------------------------------------------------
     ("q_who",         "مَن؟",          "index", "chin",       "circular",  "in",   1, False),
     ("q_what",        "ماذا؟",         "open5", "neutral",    "shake",     "up",   2, False),
     ("q_where",       "أين؟",          "index", "neutral",    "side",      "fwd",  1, False),
@@ -109,7 +109,7 @@ VOCABULARY = [
     ("q_how",         "كيف؟",          "cup",   "neutral",    "circular",  "up",   2, False),
     ("q_howmuch",     "كم؟",           "pinch", "neutral",    "shake",     "up",   1, False),
 
-    # ── ضمائر وأشخاص ────────────────────────────────────────────────────────
+    # -- ضمائر وأشخاص --------------------------------------------------------
     ("i_me",          "أنا",           "index", "chest",      "tap",       "in",   1, False),
     ("you",           "أنت",           "index", "outward",    "static",    "fwd",  1, False),
     ("he_she",        "هو/هي",         "index", "neutral",    "side",      "side", 1, False),
@@ -123,7 +123,7 @@ VOCABULARY = [
     ("friend",        "صديق",          "hook",  "chest",      "contact",   "in",   2, False),
     ("neighbour",     "جار",           "flat",  "neutral",    "side",      "in",   2, False),
 
-    # ── الصمم والتواصل ──────────────────────────────────────────────────────
+    # -- الصمم والتواصل ------------------------------------------------------
     ("deaf",          "أصم",           "index", "ear",        "arc",       "in",   1, False),
     ("hearing",       "سامع",          "index", "mouth",      "circular",  "in",   1, False),
     ("sign_lang",     "لغة إشارة",     "open5", "neutral",    "alternate", "fwd",  2, False),
@@ -133,7 +133,7 @@ VOCABULARY = [
     ("not_understand","لا أفهم",       "index", "temple",     "side",      "in",   1, False),
     ("repeat",        "أعد",           "bent",  "other_palm", "arc",       "up",   2, False),
 
-    # ── احتياجات يومية ──────────────────────────────────────────────────────
+    # -- احتياجات يومية ------------------------------------------------------
     ("water",         "ماء",           "three", "mouth",      "tap",       "side", 1, False),
     ("eat",           "أكل",           "tips",  "mouth",      "tap",       "in",   1, False),
     ("drink",         "أشرب",          "cup",   "mouth",      "arc",       "in",   1, False),
@@ -147,7 +147,7 @@ VOCABULARY = [
     ("thirsty",       "عطشان",         "index", "throat",     "down",      "in",   1, False),
     ("wait",          "انتظر",         "open5", "neutral",    "wave",      "up",   2, False),
 
-    # ── مشاعر وحالة ─────────────────────────────────────────────────────────
+    # -- مشاعر وحالة ---------------------------------------------------------
     ("fine",          "بخير",          "thumb", "chest",      "up",        "in",   1, False),
     ("happy",         "سعيد",          "flat",  "chest",      "up",        "in",   2, False),
     ("sad",           "حزين",          "open5", "eyes",       "down",      "in",   2, False),
@@ -159,7 +159,7 @@ VOCABULARY = [
     ("good",          "جيد",           "flat",  "chin",       "forward",   "up",   1, False),
     ("bad",           "سيئ",           "flat",  "chin",       "down",      "down", 1, False),
 
-    # ── الوقت ───────────────────────────────────────────────────────────────
+    # -- الوقت ---------------------------------------------------------------
     ("today",         "اليوم",         "index", "neutral",    "down",      "down", 1, False),
     ("yesterday",     "أمس",           "thumb", "shoulder",   "backward",  "in",   1, False),
     ("tomorrow",      "غداً",          "thumb", "cheek",      "forward",   "side", 1, False),
@@ -171,7 +171,7 @@ VOCABULARY = [
     ("month",         "شهر",           "index", "neutral",    "down",      "side", 2, False),
     ("year",          "سنة",           "fist",  "neutral",    "circular",  "side", 2, False),
 
-    # ── أرقام ١-١٠ (وضعيات ثابتة — مسار المصنّف الثابت) ──────────────────────
+    # -- أرقام ١-١٠ (وضعيات ثابتة — مسار المصنّف الثابت) ----------------------
     ("num_1",         "واحد",          "index", "neutral",    "static",    "fwd",  1, False),
     ("num_2",         "اثنان",         "two",   "neutral",    "static",    "fwd",  1, False),
     ("num_3",         "ثلاثة",         "three", "neutral",    "static",    "fwd",  1, False),
@@ -183,7 +183,7 @@ VOCABULARY = [
     ("num_9",         "تسعة",          "hook",  "neutral",    "static",    "fwd",  1, False),
     ("num_10",        "عشرة",          "fist",  "neutral",    "static",    "fwd",  1, False),
 
-    # ── أماكن وتنقّل ────────────────────────────────────────────────────────
+    # -- أماكن وتنقّل --------------------------------------------------------
     ("hospital",      "مستشفى",        "two",   "shoulder",   "contact",   "in",   1, False),
     ("pharmacy",      "صيدلية",        "pinch", "other_palm", "tap",       "down", 2, False),
     ("school",        "مدرسة",         "flat",  "other_palm", "tap",       "down", 2, False),
@@ -194,7 +194,7 @@ VOCABULARY = [
     ("road",          "طريق",          "flat",  "neutral",    "forward",   "side", 2, False),
     ("go",            "أذهب",          "index", "neutral",    "forward",   "fwd",  1, False),
 
-    # ── طوارئ وصحة ─────────────────────────────────────────────────────────
+    # -- طوارئ وصحة ---------------------------------------------------------
     ("emergency",     "طوارئ",         "open5", "shoulder",   "shake",     "fwd",  2, True),
     ("ambulance",     "إسعاف",         "fist",  "shoulder",   "circular",  "fwd",  1, True),
     ("police",        "شرطة",          "flat",  "chest",      "tap",       "in",   1, False),
@@ -204,7 +204,7 @@ VOCABULARY = [
     ("pain",          "ألم",           "index", "neutral",    "shake",     "in",   2, False),
     ("help_now",      "ساعدني فوراً",  "fist",  "outward",    "backward",  "up",   2, True),
 
-    # ── أفعال وأوامر شائعة ─────────────────────────────────────────────────
+    # -- أفعال وأوامر شائعة -------------------------------------------------
     ("come",          "تعال",          "index", "outward",    "backward",  "up",   1, False),
     ("sit",           "اجلس",          "two",   "other_palm", "down",      "down", 2, False),
     ("stop",          "توقف",          "flat",  "other_palm", "contact",   "side", 2, False),
@@ -331,7 +331,7 @@ def report() -> int:
         return len(errors)
     print("\n[OK] every attribute value comes from the controlled lists")
 
-    # ── How reusable are the values? (guards against circular checks) ───────
+    # -- How reusable are the values? (guards against circular checks) -------
     print()
     print("Description density — the fewer unique values, the more honest the check:")
     for f in ("shape", "location", "motion", "orient"):
@@ -340,7 +340,7 @@ def report() -> int:
         print(f"   {f:9s}: {len(c):2d} distinct | used only once: {once}"
               f" ({once / len(V) * 100:.0f}% of terms)")
 
-    # ── Real collisions ─────────────────────────────────────────────────────
+    # -- Real collisions -----------------------------------------------------
     groups = defaultdict(list)
     for e in V:
         groups[signature(e)].append(e)
@@ -359,7 +359,7 @@ def report() -> int:
     else:
         print("[OK] no exact collisions — every term has a unique signature")
 
-    # ── One-parameter separations ───────────────────────────────────────────
+    # -- One-parameter separations -------------------------------------------
     keys = ("shape", "location", "motion", "orient", "hands")
     fragile = defaultdict(list)
     for i, a in enumerate(V):

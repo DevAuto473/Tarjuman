@@ -19,8 +19,8 @@ Recording architecture
 
 Controls
 --------
-  r   →  Start recording the next 30 frames
-  q   →  Quit and save any buffered sequences
+  r   ->  Start recording the next 30 frames
+  q   ->  Quit and save any buffered sequences
 """
 
 import csv
@@ -34,7 +34,7 @@ import numpy as np
 
 # Import our smart camera abstraction (works on laptop and Raspberry Pi)
 from camera_manager import (
-    DROIDCAM_IP, DROIDCAM_PORT, SmartCamera, droidcam_url, list_local_cameras,
+    DROIDCAM_IP, DROIDCAM_PORT, SmartCamera, choose_camera_interactive, droidcam_url, list_local_cameras,
 )
 
 # Feature geometry + extraction — single source of truth shared with the server
@@ -53,9 +53,9 @@ from feature_extractor import (
 from gesture_segmenter import resample_sequence
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Configuration
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 OUTPUT_CSV = "dynamic_gestures_v4.csv"   # v4 = body-anchored features
 
@@ -65,9 +65,9 @@ OUTPUT_CSV = "dynamic_gestures_v4.csv"   # v4 = body-anchored features
 TARGET_PER_LABEL = 30
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  MediaPipe Hands setup
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Hands ONLY. Holistic additionally ran BlazePose (33 pts) and Face Mesh
 # (468 pts) every frame — the face landmarks were never used at all.
 
@@ -100,21 +100,21 @@ def get_pose_tracker() -> PoseTracker:
     return _pose_tracker
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Landmark extraction
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Deliberately NOT implemented here — see feature_extractor.py. Duplicating
 # the layout between collector and server is exactly how a silent
 # train/inference mismatch gets introduced.
 
 def extract_frame_landmarks(results, anchors=None) -> np.ndarray:
-    """Thin wrapper: shared extractor → float32 array of (VALS_PER_FRAME,)."""
+    """Thin wrapper: shared extractor -> float32 array of (VALS_PER_FRAME,)."""
     return np.array(extract_frame_features(results, anchors), dtype=np.float32)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  CSV helper
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _ensure_csv_header(filepath: str) -> None:
     """
@@ -145,8 +145,8 @@ def save_sequence(label: str, sequence: list, duration: float, filepath: str) ->
     Write one recorded gesture as a CSV row.
 
     The raw capture is used TWICE, deliberately:
-      • resampled to SEQUENCE_LENGTH → the per-frame block
-      • measured as-is                → the global block (duration, tempo,
+      • resampled to SEQUENCE_LENGTH -> the per-frame block
+      • measured as-is                -> the global block (duration, tempo,
                                         direction, openness)
 
     Order matters: globals must be computed BEFORE resampling, because
@@ -165,9 +165,9 @@ def save_sequence(label: str, sequence: list, duration: float, filepath: str) ->
         csv.writer(f).writerow(row)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Visual overlay helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 # Colour palette
 _GREEN  = (50,  220,  50)
@@ -190,7 +190,8 @@ def _put_text_with_shadow(frame, text: str, pos: tuple, color: tuple,
 
 
 def draw_overlay(frame: np.ndarray, label: str, is_recording: bool,
-                 current_frame: int, sequences_saved: int) -> None:
+                 current_frame: int, sequences_saved: int,
+                 mode: str = "manual", target: int = 0) -> None:
     """
     Render the status HUD onto the frame in-place.
 
@@ -202,15 +203,15 @@ def draw_overlay(frame: np.ndarray, label: str, is_recording: bool,
     """
     h, w = frame.shape[:2]
 
-    # ── Translucent top banner ───────────────────────────────────────────────
+    # -- Translucent top banner -----------------------------------------------
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (w, 90), (10, 10, 10), -1)
     cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
 
-    # ── Line 1: Label ────────────────────────────────────────────────────────
+    # -- Line 1: Label --------------------------------------------------------
     _put_text_with_shadow(frame, f"Gesture: {label}", (12, 28), _WHITE, scale=0.7)
 
-    # ── Line 2: Status ───────────────────────────────────────────────────────
+    # -- Line 2: Status -------------------------------------------------------
     if is_recording:
         status_text  = f"Status: RECORDING... [{current_frame} / {SEQUENCE_LENGTH}]"
         status_color = _RED
@@ -224,14 +225,19 @@ def draw_overlay(frame: np.ndarray, label: str, is_recording: bool,
         cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x2, bar_y2), _WHITE, 1)
 
     else:
-        status_text  = "Status: READY  (Press 'r' to record)"
+        prompt = ("Press 'r' for ONE take" if mode == "manual"
+                  else "Press 'r' ONCE to start the chain")
+        status_text  = f"Status: READY  ({prompt})"
         status_color = _GREEN
 
     _put_text_with_shadow(frame, status_text, (12, 72), status_color, scale=0.6)
 
-    # ── Line 3: Sequences saved counter ─────────────────────────────────────
-    saved_text = f"Saved: {sequences_saved} sequence(s)"
-    _put_text_with_shadow(frame, saved_text, (w - 220, 28), _AMBER, scale=0.58)
+    # -- Line 3: Sequences saved counter -------------------------------------
+    saved_text = (f"Saved: {sequences_saved}/{target}" if target
+                  else f"Saved: {sequences_saved}")
+    _put_text_with_shadow(frame, saved_text, (w - 230, 28), _AMBER, scale=0.58)
+    # Which mode is active decides what 'r' does — worth keeping on screen.
+    _put_text_with_shadow(frame, f"[{mode.upper()}]", (w - 230, 50), _WHITE, scale=0.5)
 
 
 def draw_landmarks_on_frame(frame: np.ndarray, results) -> None:
@@ -246,132 +252,13 @@ def draw_landmarks_on_frame(frame: np.ndarray, results) -> None:
             )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Main
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _choose_camera():
-    """
-    Ask which camera to record with.
-
-    A phone camera over DroidCam is usually much sharper than a laptop webcam,
-    and sharper frames give cleaner MediaPipe landmarks — the raw material the
-    whole model is built from. Worth the extra prompt.
-
-    Returns a source string (or int for USB index) understood by SmartCamera.
-    """
-    preset = os.getenv("CAMERA_SOURCE")
-    if preset and preset.lower() != "auto":
-        print(f"\nCamera: {preset}  (from CAMERA_SOURCE)")
-        return preset
-
-    print("\n" + "=" * 60)
-    print("  Select camera")
-    print("=" * 60)
-    print("  1. Built-in laptop webcam        (index 0)")
-    print("  2. External USB webcam           (pick from a scan)")
-    print("  3. DroidCam / phone")
-    print("  4. Other stream URL")
-    print()
-
-    while True:
-        choice = input("Choice [1-4, default 2]: ").strip() or "2"
-
-        if choice == "1":
-            # Index 0 is effectively always the built-in camera on a laptop.
-            return "laptop"
-
-        if choice == "2":
-            # An external webcam is NOT index 0, so "laptop" would silently
-            # open the built-in one instead. Scan and let the user choose.
-            print("\n  [External USB webcam]")
-            print("  Scanning camera devices...")
-            cams = list_local_cameras()
-
-            if not cams:
-                print("   [!] No camera devices responded.")
-                print("       - Is the webcam plugged in and its light on?")
-                print("       - Close Zoom / Teams / Windows Camera / OBS.")
-                print("       - Try a different USB port.")
-                continue
-
-            for idx, w, h in cams:
-                note = "   <- built-in (usually index 0)" if idx == 0 else ""
-                print(f"     index {idx}:  {w}x{h}{note}")
-
-            external = [c for c in cams if c[0] != 0]
-            default = str(external[0][0]) if external else str(cams[0][0])
-            if not external:
-                print("\n   [!] Only index 0 found — the external webcam is not")
-                print("       being detected. Check the cable/port, then re-run.")
-
-            print("\n   Not sure which is which?  npm run cameras -- --preview")
-            raw = input(f"\n   Camera index [default {default}]: ").strip() or default
-            if raw.isdigit():
-                return f"index:{raw}"
-            print("   [!] Enter one of the numbers listed above.")
-            continue
-
-        if choice == "3":
-            print("\n  [DroidCam Setup]")
-            print("  Wi-Fi MJPEG has no flow control: when bandwidth dips it")
-            print("  silently DROPS frames, and lost frames distort the exact")
-            print("  timing the model learns from. Prefer USB for recording.")
-            print()
-            print("  1. USB - virtual webcam    <- iPhone AND Android")
-            print("  2. USB - adb tunnel        <- ANDROID ONLY (no PC client)")
-            print("  3. Wi-Fi                   (requires IP, may stutter)")
-            print()
-            print("  iPhone: adb cannot talk to iOS at all — use option 1.")
-            dc_mode = input("  Choose mode [1-3, default 1]: ").strip() or "1"
-
-            if dc_mode == "3":
-                print("\n  Before continuing:")
-                print("   - DroidCam app is OPEN on the phone")
-                print("   - Phone and PC are on the same Wi-Fi")
-                print(f"   - The app shows {DROIDCAM_IP}:{DROIDCAM_PORT}")
-                print("   (change via DROIDCAM_IP / DROIDCAM_PORT in .env)")
-                return "droidcam"
-
-            if dc_mode == "2":
-                print("\n  [adb tunnel - ANDROID ONLY]")
-                print("   This will NOT work with an iPhone.")
-                print("   1. Platform Tools folder set in .env as ADB_PATH")
-                print("   2. Developer Options ON (tap Build number 7 times)")
-                print("   3. USB debugging ON")
-                print("   4. DroidCam app OPEN on the phone")
-                print("   5. Cable connected, 'Allow USB debugging' accepted")
-                return "droidcam-usb"
-
-            # Default: virtual webcam — works for iPhone and Android alike
-            print("\n  [USB - virtual webcam]")
-            print("   1. DroidCam (or iVCam / Camo) PC client is OPEN")
-            print("   2. Mode set to USB, 'Connect' pressed")
-            print("   3. Phone connected by cable, app open on the phone")
-            print("   iPhone also needs Apple's iTunes / Apple Devices installed")
-            print("   (it provides the USB drivers Windows needs).")
-            print("\n  Scanning local camera devices...")
-            cams = list_local_cameras()
-            if cams:
-                for idx, w, h in cams:
-                    hint = "   <- likely the phone (higher resolution)" if w >= 1280 else ""
-                    print(f"     index {idx}:  {w}x{h}{hint}")
-            else:
-                print("     [!] No devices responded. Is the PC client connected?")
-            cam_idx = input("\n   Camera index [default 1]: ").strip() or "1"
-            try:
-                return int(cam_idx)
-            except ValueError:
-                return "usb_dshow"
-
-        if choice == "4":
-            url = input("  Stream URL: ").strip()
-            if "://" in url:
-                return url
-            print("  [!] Must be a full URL, e.g. http://192.168.8.177:4747/video")
-            continue
-
-        print("  [!] Enter 1, 2, 3 or 4.")
+    """Kept as a thin alias; the implementation lives in camera_manager."""
+    return choose_camera_interactive()
 
 
 def _existing_counts(filepath: str) -> dict:
@@ -397,10 +284,10 @@ def _choose_label() -> str:
         from vocabulary import as_dicts
         vocab = as_dicts()
     except Exception as exc:
-        print(f"⚠️  vocabulary.py unavailable ({exc}) — falling back to free text.")
+        print(f"[!]  vocabulary.py unavailable ({exc}) — falling back to free text.")
         label = input("\nEnter the gesture label: ").strip()
         if not label:
-            print("❌ Label cannot be empty. Exiting.")
+            print("[FAIL] Label cannot be empty. Exiting.")
             sys.exit(1)
         return label
 
@@ -433,7 +320,7 @@ def _choose_label() -> str:
 
 
 def main() -> None:
-    # ── Terminal prompt: get gesture label before opening camera window ──────
+    # -- Terminal prompt: get gesture label before opening camera window ------
     print("=" * 60)
     print("  Tarjuman — Dynamic Gesture Sequence Recorder")
     print("=" * 60)
@@ -446,39 +333,71 @@ def main() -> None:
     # you have picked a label and mentally prepared to sign.
     camera_source = _choose_camera()
 
-    # ── Pick the label from the official vocabulary ─────────────────────────
+    # -- Pick the label from the official vocabulary -------------------------
     # Typing labels freehand is how a dataset ends up with "test1", "test_1"
     # and "test 2" as three separate classes. Choosing from the list keeps the
     # ids consistent with vocabulary.py and shows progress as you go.
     label = _choose_label()
 
     target_sequences = input(
-        f"📦 How many sequences to record for '{label}'? [default: 30]: "
+        f" How many sequences to record for '{label}'? [default: 30]: "
     ).strip()
     target_sequences = int(target_sequences) if target_sequences.isdigit() else 30
 
-    auto_input = input("⚡ Auto-record mode? Type 'y' for Dynamic (1s pause), 'h' for Static Hold (0s pause), or Enter for Manual: ").strip().lower()
-    is_auto = (auto_input in ['y', 'h'])
-    auto_pause = 0.0 if auto_input == 'h' else 1.0
+    # -- Recording mode -------------------------------------------------------
+    # Three distinct rhythms, because the signs themselves have three rhythms:
+    #   dynamic — travelling signs; a pause between takes lets you reset
+    #   static  — held handshapes (numbers, أنت); no pause needed
+    #   manual  — one take per keypress; full control between takes
+    print("\n" + "=" * 62)
+    print("  Recording mode")
+    print("=" * 62)
+    print("  1. Dynamic  — auto chain, 1s pause between takes")
+    print("  2. Static   — auto chain, no pause (held handshapes)")
+    print("  3. Manual   — ONE take per 'r' press")
+    print()
+    print("  Manual is best when each take needs repositioning, a different")
+    print("  distance, or a different signer — which is exactly the variety")
+    print("  the model needs. Auto is faster once you have a rhythm.")
+    print()
 
-    print(f"\n✅ Recording {target_sequences} sequences for label: '{label}'")
-    if is_auto:
-        print("   Auto-mode is ON. Press 'r' ONCE to start the chain.")
+    mode_input = input("Mode [1-3, default 3]: ").strip().lower() or "3"
+
+    # Legacy single-letter answers still work.
+    if mode_input in ("1", "y", "d"):
+        mode = "dynamic"
+    elif mode_input in ("2", "h", "s"):
+        mode = "static"
     else:
-        print("   Press 'r' inside the camera window to start each sequence.")
+        mode = "manual"
+
+    is_auto = mode in ("dynamic", "static")
+    auto_pause = 0.0 if mode == "static" else 1.0
+
+    print(f"\n[OK] Recording {target_sequences} sequences for label: '{label}'")
+    print(f"   Mode: {mode.upper()}")
+    if mode == "dynamic":
+        print("   Press 'r' ONCE to start the chain; takes continue automatically")
+        print(f"   with a {auto_pause:.0f}s pause between them.")
+    elif mode == "static":
+        print("   Press 'r' ONCE to start the chain; takes run back to back.")
+        print("   Hold the handshape steady throughout.")
+    else:
+        print("   Press 'r' for EACH take — one sequence per press.")
+        print("   Reposition, change distance, or swap signer between takes.")
     print("   Press 'q' to quit early.\n")
 
-    # ── Ensure CSV exists with the correct header ────────────────────────────
+    # -- Ensure CSV exists with the correct header ----------------------------
     _ensure_csv_header(OUTPUT_CSV)
 
-    # ── State variables ──────────────────────────────────────────────────────
+    # -- State variables ------------------------------------------------------
     is_recording     = False
     current_sequence = []       # Accumulates frame landmark arrays
     record_started_at = 0.0     # wall clock — real duration, not frame count
     sequences_saved  = 0
     next_auto_start_time = float('inf')
 
-    # ── Camera + main loop ───────────────────────────────────────────────────
+    # -- Camera + main loop ---------------------------------------------------
     pose_tracker = get_pose_tracker()
     cam = SmartCamera(source=camera_source)
     cam.start()
@@ -501,7 +420,7 @@ def main() -> None:
             # Mirror the frame (shared switch, identical to the live server)
             frame = prepare_frame(frame)
 
-            # ── MediaPipe processing ─────────────────────────────────────────
+            # -- MediaPipe processing -----------------------------------------
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             rgb.flags.writeable = False
             results = hands.process(rgb)
@@ -509,17 +428,17 @@ def main() -> None:
             anchors = pose_tracker.update(rgb)
             rgb.flags.writeable = True
 
-            # ── Draw skeleton on the display frame ───────────────────────────
+            # -- Draw skeleton on the display frame ---------------------------
             draw_landmarks_on_frame(frame, results)
 
-            # ── Recording state machine ──────────────────────────────────────
+            # -- Recording state machine --------------------------------------
             if is_recording:
                 # Extract landmarks for this frame (zero-padded if not detected)
                 frame_data = extract_frame_landmarks(results, anchors)
                 current_sequence.append(frame_data)
 
                 if len(current_sequence) == SEQUENCE_LENGTH:
-                    # Sequence complete → save to CSV.
+                    # Sequence complete -> save to CSV.
                     # Duration is MEASURED, not assumed: the same 30 frames can
                     # span 1 s or 2 s depending on camera load, and several
                     # signs mean what they mean because of their tempo.
@@ -527,7 +446,7 @@ def main() -> None:
                     save_sequence(label, current_sequence, duration, OUTPUT_CSV)
                     sequences_saved += 1
                     print(
-                        f"  ✅ Sequence {sequences_saved}/{target_sequences} "
+                        f"  [OK] Sequence {sequences_saved}/{target_sequences} "
                         f"saved for '{label}'  ({duration:.2f}s)"
                     )
 
@@ -536,7 +455,7 @@ def main() -> None:
                     is_recording     = False
 
                     if sequences_saved >= target_sequences:
-                        print(f"\n🎉 All {target_sequences} sequences recorded! Closing.")
+                        print(f"\n All {target_sequences} sequences recorded! Closing.")
                         break
                     
                     if is_auto:
@@ -548,44 +467,45 @@ def main() -> None:
                 current_sequence = []
                 record_started_at = time.time()
                 next_auto_start_time = float('inf')
-                print(f"  🔴 Auto-Recording sequence {sequences_saved + 1}/{target_sequences}...")
+                print(f"  [REC] Auto-Recording sequence {sequences_saved + 1}/{target_sequences}...")
 
-            # ── HUD overlay ──────────────────────────────────────────────────
+            # -- HUD overlay --------------------------------------------------
             draw_overlay(
                 frame, label, is_recording,
                 len(current_sequence), sequences_saved,
+                mode=mode, target=target_sequences,
             )
 
             cv2.imshow(f"Tarjuman Recorder — '{label}'", frame)
 
-            # ── Keyboard handling ─────────────────────────────────────────────
+            # -- Keyboard handling ---------------------------------------------
             key = cv2.waitKey(1) & 0xFF
 
             if key == ord("r") and not is_recording:
                 is_recording      = True
                 current_sequence  = []
                 record_started_at = time.time()
-                print(f"  🔴 Recording sequence {sequences_saved + 1}/{target_sequences}...")
+                print(f"  [REC] Recording sequence {sequences_saved + 1}/{target_sequences}...")
 
             elif key == ord("q"):
-                print("\n⏹  Quit key pressed. Stopping early.")
+                print("\n[stop]  Quit key pressed. Stopping early.")
                 break
 
     finally:
-        # ── Graceful teardown ────────────────────────────────────────────────
+        # -- Graceful teardown ------------------------------------------------
         hands.close()
         pose_tracker.close()
         cam.release()
         cv2.destroyAllWindows()
 
-        print(f"\n📊 Session summary for '{label}':")
+        print(f"\n Session summary for '{label}':")
         print(f"   Sequences recorded : {sequences_saved}")
         print(f"   Output file        : {os.path.abspath(OUTPUT_CSV)}")
 
         if sequences_saved > 0:
-            print("✅ Data saved successfully.")
+            print("[OK] Data saved successfully.")
         else:
-            print("⚠️  No sequences were saved in this session.")
+            print("[!]  No sequences were saved in this session.")
 
 
 if __name__ == "__main__":

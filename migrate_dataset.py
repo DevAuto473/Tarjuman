@@ -19,8 +19,8 @@ carry no visibility score, and the old collector wrote a
 
 New layout (per frame, 126 values) — see feature_extractor.py
 -------------------------------------------------------------
-    [  0 :  63 ]  Left hand   → raw wrist (3) + 20 landmarks relative (60)
-    [ 63 : 126 ]  Right hand  → same
+    [  0 :  63 ]  Left hand   -> raw wrist (3) + 20 landmarks relative (60)
+    [ 63 : 126 ]  Right hand  -> same
 
 A hand that was absent in the old row (all 84 values zero) stays absent:
 it is written as 63 zeros rather than being fabricated from zero coordinates.
@@ -48,9 +48,9 @@ from feature_extractor import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Legacy geometry (the format we are migrating FROM)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 OLD_N_POSE          = 33
 OLD_COORDS_PER_LM   = 4                       # x, y, z, visibility
@@ -63,9 +63,9 @@ DEFAULT_INPUT  = "dynamic_gestures.csv"
 DEFAULT_OUTPUT = "dynamic_gestures_v2.csv"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Conversion helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def convert_hand_block(block: list[float]) -> list[float]:
     """
@@ -86,7 +86,7 @@ def convert_hand_block(block: list[float]) -> list[float]:
     if not any(block):
         return [0.0] * VALS_PER_HAND
 
-    # Drop the always-zero visibility column → (21, 3)
+    # Drop the always-zero visibility column -> (21, 3)
     coords = np.asarray(block, dtype=np.float64).reshape(
         N_HAND_LANDMARKS, OLD_COORDS_PER_LM
     )[:, :3]
@@ -137,21 +137,21 @@ def main() -> None:
     args = parser.parse_args()
 
     print("=" * 68)
-    print("   🔄  Tarjuman — Dataset Migration  (Holistic 9 000 → Hands 3 780)")
+    print("     Tarjuman — Dataset Migration  (Holistic 9 000 -> Hands 3 780)")
     print("=" * 68)
 
     if not os.path.isfile(args.input):
-        print(f"\n❌  Input file not found: {args.input}")
+        print(f"\n[FAIL]  Input file not found: {args.input}")
         sys.exit(1)
 
     if os.path.exists(args.output) and not args.force:
-        print(f"\n❌  Output file already exists: {args.output}")
-        print("    → Re-run with --force to overwrite it.")
+        print(f"\n[FAIL]  Output file already exists: {args.output}")
+        print("    -> Re-run with --force to overwrite it.")
         sys.exit(1)
 
-    print(f"\n📂  Input  : {args.input}")
-    print(f"📂  Output : {args.output}")
-    print(f"    {OLD_TOTAL_FEATURES} features/row  →  {TOTAL_FEATURES} features/row")
+    print(f"\n  Input  : {args.input}")
+    print(f"  Output : {args.output}")
+    print(f"    {OLD_TOTAL_FEATURES} features/row  ->  {TOTAL_FEATURES} features/row")
 
     rows_written  = 0
     rows_skipped  = 0
@@ -167,12 +167,12 @@ def main() -> None:
 
         header = next(reader, None)
         if header is None:
-            print("\n❌  Input file is empty.")
+            print("\n[FAIL]  Input file is empty.")
             sys.exit(1)
 
         expected_cols = OLD_TOTAL_FEATURES + 1
         if len(header) != expected_cols:
-            print(f"\n⚠️  Warning: header has {len(header)} columns, "
+            print(f"\n[!]  Warning: header has {len(header)} columns, "
                   f"expected {expected_cols}. Rows will still be validated individually.")
 
         writer.writerow(build_header())
@@ -185,7 +185,7 @@ def main() -> None:
             values = row[1:]
 
             if len(values) != OLD_TOTAL_FEATURES:
-                print(f"   ⚠️  Line {line_no}: expected {OLD_TOTAL_FEATURES} "
+                print(f"   [!]  Line {line_no}: expected {OLD_TOTAL_FEATURES} "
                       f"features, found {len(values)} — skipped.")
                 rows_skipped += 1
                 continue
@@ -193,7 +193,7 @@ def main() -> None:
             try:
                 numeric = [float(v) for v in values]
             except ValueError as exc:
-                print(f"   ⚠️  Line {line_no}: non-numeric value ({exc}) — skipped.")
+                print(f"   [!]  Line {line_no}: non-numeric value ({exc}) — skipped.")
                 rows_skipped += 1
                 continue
 
@@ -216,21 +216,21 @@ def main() -> None:
                 if any(converted[base + VALS_PER_HAND:base + VALS_PER_FRAME]):
                     presence[1] += 1
 
-    # ── Summary ──────────────────────────────────────────────────────────────
-    print(f"\n✅  Migration complete")
-    print(f"    ├─ rows written : {rows_written:,}")
-    print(f"    └─ rows skipped : {rows_skipped:,}")
+    # -- Summary --------------------------------------------------------------
+    print(f"\n[OK]  Migration complete")
+    print(f"    |-- rows written : {rows_written:,}")
+    print(f"    `-- rows skipped : {rows_skipped:,}")
 
     if label_counts:
-        print(f"\n📊  Samples per label:")
+        print(f"\n  Samples per label:")
         for label in sorted(label_counts):
             total_frames = label_counts[label] * SEQUENCE_LENGTH
             lh, rh = hand_presence[label]
-            print(f"    ├─ {label:<20} {label_counts[label]:>4} samples   "
+            print(f"    |-- {label:<20} {label_counts[label]:>4} samples   "
                   f"(left hand in {lh / total_frames * 100:5.1f}% of frames, "
                   f"right hand in {rh / total_frames * 100:5.1f}%)")
 
-    print(f"\n➡️   Next: retrain on the new file")
+    print(f"\n->   Next: retrain on the new file")
     print(f"    1. point INPUT_CSV in train_model.py to '{args.output}'")
     print(f"    2. python train_model.py")
     print("=" * 68)

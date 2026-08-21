@@ -5,8 +5,8 @@ Architecture overview
 ---------------------
   • The React frontend NO LONGER streams video frames.
   • The frontend sends two simple JSON control commands:
-        {"type": "start_camera"}   → launches the background camera loop
-        {"type": "stop_camera"}    → cancels the loop and releases the camera
+        {"type": "start_camera"}   -> launches the background camera loop
+        {"type": "stop_camera"}    -> cancels the loop and releases the camera
   • The backend owns the camera (SmartCamera), runs MediaPipe Hands
     locally, and emits a lightweight JSON heartbeat to the client:
         {"type": "tracking_status", "body_visible": bool, "hands_visible": bool}
@@ -15,21 +15,21 @@ Architecture overview
 
 Message protocol (text / JSON)
 -------------------------------
-  Client  → Server  |  {"type": "start_camera"}
-  Client  → Server  |  {"type": "stop_camera"}
-  Client  → Server  |  {"type": "speak", "value": "..."}
-  Client  → Server  |  {"type": "user_question", "data": "...", "history": [...]}
-  Server  → Client  |  {"type": "tracking_status", "body_visible": bool, "hands_visible": bool}
-  Server  → Client  |  {"type": "letter",    "value": "أ"}
-  Server  → Client  |  {"type": "pose_data", "distance": {...}}
-  Server  → Client  |  {"type": "ai_response", "data": {...}}
-  Server  → Client  |  <binary 0x01 header> + MP3 audio bytes  (TTS)
-  Server  → Client  |  {"type": "stt_result", "purpose": str, "value": str}
+  Client  -> Server  |  {"type": "start_camera"}
+  Client  -> Server  |  {"type": "stop_camera"}
+  Client  -> Server  |  {"type": "speak", "value": "..."}
+  Client  -> Server  |  {"type": "user_question", "data": "...", "history": [...]}
+  Server  -> Client  |  {"type": "tracking_status", "body_visible": bool, "hands_visible": bool}
+  Server  -> Client  |  {"type": "letter",    "value": "أ"}
+  Server  -> Client  |  {"type": "pose_data", "distance": {...}}
+  Server  -> Client  |  {"type": "ai_response", "data": {...}}
+  Server  -> Client  |  <binary 0x01 header> + MP3 audio bytes  (TTS)
+  Server  -> Client  |  {"type": "stt_result", "purpose": str, "value": str}
 
 Binary audio protocol (unchanged)
 ----------------------------------
-  0x01  + <bytes>  → audio to translate via STT
-  0x02  + <bytes>  → audio for conversational chat via STT
+  0x01  + <bytes>  -> audio to translate via STT
+  0x02  + <bytes>  -> audio for conversational chat via STT
 """
 
 import asyncio
@@ -54,8 +54,11 @@ import websockets
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
-from camera_manager import SmartCamera
+from camera_manager import (
+    SmartCamera, choose_camera_interactive, describe_cameras, droidcam_url,
+)
 from dtw_matcher import SignReferenceLibrary
+from pose_to_bones import frame_to_bone_dirs
 from gesture_segmenter import GestureSegmenter
 from feature_extractor import (
     SEQUENCE_LENGTH,
@@ -69,13 +72,13 @@ from feature_extractor import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Global configuration
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 warnings.filterwarnings("ignore")
 
-# ── Secrets: loaded from .env, never hardcoded ───────────────────────────────
+# -- Secrets: loaded from .env, never hardcoded -------------------------------
 # Create a .env file next to this script (see .env.example) containing:
 #     OPENROUTER_API_KEY=sk-or-v1-...
 #     GROQ_API_KEY=gsk_...
@@ -92,14 +95,14 @@ _missing_keys = [
     ) if not value
 ]
 if _missing_keys:
-    print("❌  Missing required environment variable(s): " + ", ".join(_missing_keys))
-    print("    → Create a .env file next to websocket_server.py containing:")
+    print("[FAIL]  Missing required environment variable(s): " + ", ".join(_missing_keys))
+    print("    -> Create a .env file next to websocket_server.py containing:")
     for name in _missing_keys:
         print(f"        {name}=<your key>")
-    print("    → See .env.example for the expected format.")
+    print("    -> See .env.example for the expected format.")
     sys.exit(1)
 
-# ── Network binding ──────────────────────────────────────────────────────────
+# -- Network binding ----------------------------------------------------------
 # Bound to loopback ONLY. The Tauri frontend runs on the same machine and
 # connects via ws://localhost:8765, so there is no reason to expose this
 # server to the local network. Binding to 0.0.0.0 would let any device on the
@@ -107,26 +110,32 @@ if _missing_keys:
 BIND_HOST = "127.0.0.1"
 BIND_PORT = 8765
 
-# ── Camera source ────────────────────────────────────────────────────────────
-#   auto      → Picamera2 on a Pi, otherwise the local webcam
-#   laptop    → force the local webcam
-#   droidcam  → phone over DroidCam (uses DROIDCAM_IP / DROIDCAM_PORT)
-#   <url>     → any MJPEG / RTSP stream
+# -- Camera source ------------------------------------------------------------
+#   auto      -> Picamera2 on a Pi, otherwise the local webcam
+#   laptop    -> force the local webcam
+#   droidcam  -> phone over DroidCam (uses DROIDCAM_IP / DROIDCAM_PORT)
+#   <url>     -> any MJPEG / RTSP stream
 # Set CAMERA_SOURCE in .env. Whatever the DATASET was recorded with is usually
 # what inference should use too — a model trained on sharp phone frames sees a
 # different world through a soft laptop webcam.
 CAMERA_SOURCE = os.getenv("CAMERA_SOURCE", "auto")
 
+# The ACTIVE source, which the user can change from the app at runtime.
+# `.env` only supplies the starting value: a camera that turns out to be the
+# wrong one should not require editing a file and restarting the server, which
+# is exactly the situation this variable exists to avoid.
+_active_camera_source = CAMERA_SOURCE
+
 CONFIDENCE_THRESHOLD = 0.65
 
-# ── Recognition mode ─────────────────────────────────────────────────────────
+# -- Recognition mode ---------------------------------------------------------
 #   "segmented" (default) — event-driven: detect when a sign starts and ends,
 #                           classify ONCE. Latency ≈ the sign's own duration.
 #   "sliding"             — legacy: keep a rolling 30-frame window and re-run
 #                           inference every frame. Kept for A/B comparison.
 RECOGNITION_MODE = "segmented"
 
-# ── Camera preview ───────────────────────────────────────────────────────────
+# -- Camera preview -----------------------------------------------------------
 # The original "zero-bandwidth" design withheld video from the UI to save
 # bandwidth — but frontend and backend run on the SAME machine over loopback,
 # so there was no bandwidth to save. The cost of that choice was real though:
@@ -142,7 +151,11 @@ PREVIEW_QUALITY   = 50      # JPEG quality 0-100
 PREVIEW_FPS       = 12      # throttle; recognition still runs at full rate
 PREVIEW_SKELETON  = True    # draw detected hand landmarks onto the preview
 
-# Binary frame headers, server → client
+# Live-mirror stream rate. Recognition still sees every frame; only the avatar
+# update is throttled, since the eye cannot use more than this.
+MIRROR_FPS = 20
+
+# Binary frame headers, server -> client
 BIN_AUDIO   = 0x01          # MP3 speech (existing)
 BIN_PREVIEW = 0x02          # JPEG camera preview (new)
 
@@ -156,7 +169,7 @@ FRAME_STABILITY_LIMIT = 2
 # Never redeclare these here — divergence between collector and server is
 # exactly the silent train/inference mismatch this module exists to prevent.
 
-# Arabic label map (English folder names → Arabic glyphs)
+# Arabic label map (English folder names -> Arabic glyphs)
 LABEL_TO_ARABIC = {
     "Alef": "أ", "Al": "ال", "Ain": "ع", "Beh": "ب", "Teh": "ت",
     "Theh": "ث", "Jeem": "ج", "Hah": "ح", "Khah": "خ", "Dal": "د",
@@ -165,14 +178,14 @@ LABEL_TO_ARABIC = {
     "Feh": "ف", "Qaf": "ق", "Kaf": "ك", "Lam": "ل", "Laa": "لا",
     "Meem": "م", "Noon": "ن", "Heh": "هـ", "Waw": "و", "Yeh": "ي",
     "Teh_Marbuta": "ة", "Alslam_3lykm": "السلام عليكم",
-    "ma_esmk": "ما اِسمك؟", "kyf_7alk": "كيفَ حالُكَ؟",
-    "test_1": "ليمونة", "test 2": "بابايا"
-}
+    "ma_esmk": "ما اِسمك؟", "kyf_7alk": "كيفَ حالُكَ؟", "salam": "السلام عليكم",
+
+ }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  ONNX model + label map loading
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 ONNX_MODEL_PATH = "sign_model.onnx"
 LABELS_JSON     = "labels.json"
@@ -202,7 +215,7 @@ def _disable_recognition(*reason_lines: str) -> None:
     print("\n" + "!" * 70)
     for line in reason_lines:
         print(line)
-    print("   → Sign recognition is DISABLED. Camera / TTS / STT still work.")
+    print("   -> Sign recognition is DISABLED. Camera / TTS / STT still work.")
     print("!" * 70 + "\n")
 
 
@@ -232,7 +245,7 @@ def _validate_onnx_session(sess, labels: dict) -> tuple[str, str]:
     inputs  = sess.get_inputs()
     outputs = sess.get_outputs()
 
-    # ── 1. Single input tensor ──────────────────────────────────────────────
+    # -- 1. Single input tensor ----------------------------------------------
     if len(inputs) != 1:
         raise ValueError(
             f"Expected exactly 1 input tensor, found {len(inputs)}: "
@@ -241,7 +254,7 @@ def _validate_onnx_session(sess, labels: dict) -> tuple[str, str]:
 
     inp = inputs[0]
 
-    # ── 2. Input shape — the critical check ─────────────────────────────────
+    # -- 2. Input shape — the critical check ---------------------------------
     # Shape is [batch, features]; batch is dynamic (None/'N'), features fixed.
     if len(inp.shape) != 2:
         raise ValueError(
@@ -259,19 +272,19 @@ def _validate_onnx_session(sess, labels: dict) -> tuple[str, str]:
             f"Incompatible model detected. Expected {TOTAL_FEATURES} features "
             f"({SEQUENCE_LENGTH} frames × {VALS_PER_FRAME} landmarks), "
             f"got {n_features}.\n"
-            f"   → A {n_features}-feature model is almost certainly built from "
+            f"   -> A {n_features}-feature model is almost certainly built from "
             f"a different feature layout (e.g. the old static-hand pipeline).\n"
-            f"   → Re-run train_model.py to regenerate {ONNX_MODEL_PATH}."
+            f"   -> Re-run train_model.py to regenerate {ONNX_MODEL_PATH}."
         )
 
-    # ── 3. Probabilities output must exist ──────────────────────────────────
+    # -- 3. Probabilities output must exist ----------------------------------
     # With zipmap=False, skl2onnx emits [0]='label', [1]='probabilities'.
     # Resolve by name where possible, fall back to index 1.
     if len(outputs) < 2:
         raise ValueError(
             f"Expected 2 outputs (label + probabilities), found "
             f"{len(outputs)}: {[o.name for o in outputs]}.\n"
-            f"   → Was the model exported without options={{'clf': "
+            f"   -> Was the model exported without options={{'clf': "
             f"{{'zipmap': False}}}}?"
         )
 
@@ -279,18 +292,18 @@ def _validate_onnx_session(sess, labels: dict) -> tuple[str, str]:
         (o for o in outputs if "prob" in o.name.lower()), outputs[1]
     )
 
-    # ── 4. Class count ↔ label-map consistency ──────────────────────────────
+    # -- 4. Class count <-> label-map consistency ------------------------------
     n_classes = prob_out.shape[1] if len(prob_out.shape) == 2 else None
     if isinstance(n_classes, int) and n_classes != len(labels):
         raise ValueError(
             f"Label map is out of sync with the model: the model outputs "
             f"{n_classes} class probabilities but {LABELS_JSON} defines "
             f"{len(labels)}.\n"
-            f"   → {ONNX_MODEL_PATH} and {LABELS_JSON} must come from the SAME "
+            f"   -> {ONNX_MODEL_PATH} and {LABELS_JSON} must come from the SAME "
             f"train_model.py run."
         )
 
-    # ── 5. Label map must cover every class index 0..n-1 ────────────────────
+    # -- 5. Label map must cover every class index 0..n-1 --------------------
     # Inference maps argmax(probabilities) directly to a label_map key, which
     # is only valid because LabelEncoder produces sorted integer classes 0..n-1.
     expected_classes = n_classes if isinstance(n_classes, int) else len(labels)
@@ -321,28 +334,28 @@ try:
     label_map       = candidate_labels
 
     print(
-        f"✅  ONNX model loaded and validated: {ONNX_MODEL_PATH}\n"
-        f"    ├─ input  : '{onnx_input_name}' "
+        f"[OK]  ONNX model loaded and validated: {ONNX_MODEL_PATH}\n"
+        f"    |-- input  : '{onnx_input_name}' "
         f"[batch, {TOTAL_FEATURES}] ({SEQUENCE_LENGTH} frames × {VALS_PER_FRAME})\n"
-        f"    ├─ output : '{onnx_prob_name}'\n"
-        f"    └─ classes: {len(label_map)}"
+        f"    |-- output : '{onnx_prob_name}'\n"
+        f"    `-- classes: {len(label_map)}"
     )
 
 except FileNotFoundError as exc:
     _disable_recognition(
-        f"⚠️  Model file not found: {exc.filename}",
-        "   → Run train_model.py first to generate it.",
+        f"[!]  Model file not found: {exc.filename}",
+        "   -> Run train_model.py first to generate it.",
     )
 except ValueError as exc:
     # Raised by _validate_onnx_session — the incompatible-model case
-    _disable_recognition(f"❌  ERROR: {exc}")
+    _disable_recognition(f"[FAIL]  ERROR: {exc}")
 except Exception as exc:
     _disable_recognition(
-        f"❌  ERROR: Failed to load {ONNX_MODEL_PATH}: "
+        f"[FAIL]  ERROR: Failed to load {ONNX_MODEL_PATH}: "
         f"{type(exc).__name__}: {exc}"
     )
 
-# ── DTW reference library ("تعلم مع ترجمان") ─────────────────────────────────
+# -- DTW reference library ("تعلم مع ترجمان") ---------------------------------
 # Built from the same CSV the classifier trains on, so practice mode works
 # without recording a separate reference set. Adding a new word to the
 # dictionary needs only one new recording — no retraining.
@@ -361,16 +374,16 @@ _preview_dot_spec  = mp_drawing.DrawingSpec(color=(80, 220, 120), thickness=1, c
 _preview_line_spec = mp_drawing.DrawingSpec(color=(200, 200, 200), thickness=1)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  AI / TTS / STT clients
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 or_client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY,
 )
 
-# ── Assistant model ──────────────────────────────────────────────────────────
+# -- Assistant model ----------------------------------------------------------
 # Overridable from .env so the model can be swapped without touching code:
 #     AI_MODEL=perplexity/sonar-pro
 #
@@ -451,9 +464,9 @@ def build_system_prompt() -> str:
 ج: درجة الحرارة في الرياض الآن ٣٨ مئوية، والجو صحو مع رياح خفيفة."""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Utility: safe JSON send
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 async def send_to_client(ws, msg_dict: dict) -> None:
     """
@@ -469,13 +482,13 @@ async def send_to_client(ws, msg_dict: dict) -> None:
     except websockets.exceptions.ConnectionClosed:
         pass      # expected during disconnect
     except Exception as exc:
-        print(f"⚠️  send failed for {msg_dict.get('type', '?')!r}: "
+        print(f"[!]  send failed for {msg_dict.get('type', '?')!r}: "
               f"{type(exc).__name__}: {exc}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Client session state
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 class ClientSession:
     """
@@ -488,41 +501,48 @@ class ClientSession:
     def __init__(self, ws):
         self.ws = ws
 
-        # ── Sign-recognition streak tracking ────────────────────────────────
+        # -- Sign-recognition streak tracking --------------------------------
         self.current_streak        = 0
         self.last_predicted_letter = None
         self.confirmed_letter      = None
 
-        # ── Practice mode ("تعلم مع ترجمان") ────────────────────────────────
+        # -- Practice mode ("تعلم مع ترجمان") --------------------------------
         # When set, a completed gesture is graded against the DTW reference for
         # this label instead of being classified and appended as translated
         # text. None means normal translation mode.
         self.practice_target: str | None = None
 
-        # ── Gesture segmentation (segmented mode) ───────────────────────────
+        # -- Live mirror ------------------------------------------------------
+        # When on, every frame's bone directions are streamed to the avatar so
+        # the robot copies the user in real time. Throttled separately from
+        # recognition: the model wants every frame, the eye does not.
+        self.mirror_live = False
+        self.mirror_next_at = 0.0
+
+        # -- Gesture segmentation (segmented mode) ---------------------------
         # Detects the real start/end of a sign so inference runs once per
         # gesture instead of once per frame.
         self.segmenter = GestureSegmenter()
         self.was_capturing = False       # for capture-state change events
 
-        # ── Sliding window (legacy mode only) ───────────────────────────────
+        # -- Sliding window (legacy mode only) -------------------------------
         # Holds the last 30 extracted feature frames (each VALS_PER_FRAME
         # floats). When full, the deque is flattened into a TOTAL_FEATURES
         # vector for ONNX inference.
         self.frames_window = collections.deque(maxlen=SEQUENCE_LENGTH)
 
-        # ── Camera-loop task handle ──────────────────────────────────────────
+        # -- Camera-loop task handle ------------------------------------------
         # Guarded by the single asyncio thread — no locking needed.
         self.camera_task = None   # asyncio.Task | None
 
-        # ── Per-session body anchors ─────────────────────────────────────────
+        # -- Per-session body anchors -----------------------------------------
         # Location is a defining parameter of a sign, so hands are expressed
         # relative to the body rather than to the picture. Pose is throttled
         # internally; one tracker per session because MediaPipe graph objects
         # are not safe to share across threads.
         self.pose_tracker = PoseTracker()
 
-        # ── Per-session MediaPipe Hands ──────────────────────────────────────
+        # -- Per-session MediaPipe Hands --------------------------------------
         self.hands = mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=2,
@@ -545,25 +565,25 @@ class ClientSession:
         try:
             self.hands.close()
         except Exception as exc:
-            print(f"⚠️  Error closing MediaPipe Hands: {type(exc).__name__}: {exc}")
+            print(f"[!]  Error closing MediaPipe Hands: {type(exc).__name__}: {exc}")
         try:
             self.pose_tracker.close()
         except Exception as exc:
-            print(f"⚠️  Error closing PoseTracker: {type(exc).__name__}: {exc}")
+            print(f"[!]  Error closing PoseTracker: {type(exc).__name__}: {exc}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Feature extraction helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 # Feature extraction lives in feature_extractor.py — imported at the top of
 # this file so the collector, the server and the migration script can never
 # drift apart. Do not re-implement it here.
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Frame processing (sync — runs in executor thread)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 # De-duplication state for per-frame error reporting (see except block below).
 # process_frame_sync runs ~30×/second, so raw printing would flood the console.
@@ -599,7 +619,7 @@ def _encode_preview(frame: np.ndarray, results) -> bytes | None:
         return buf.tobytes() if ok else None
 
     except Exception as exc:
-        print(f"⚠️  Preview encode failed: {type(exc).__name__}: {exc}")
+        print(f"[!]  Preview encode failed: {type(exc).__name__}: {exc}")
         return None
 
 
@@ -641,7 +661,7 @@ def process_frame_sync(frame: np.ndarray,
          [left hand 63] + [right hand 63], each = raw wrist (3) + 20 landmarks
          relative to the wrist (60). A missing hand contributes 63 zeros.
       3. Append the vector to the sliding window deque.
-      4. When the deque reaches SEQUENCE_LENGTH frames, flatten →
+      4. When the deque reaches SEQUENCE_LENGTH frames, flatten ->
          (1, TOTAL_FEATURES) float32 and run ONNX inference.
 
     Dispatched via loop.run_in_executor() so heavy CPU work does not stall
@@ -674,13 +694,13 @@ def process_frame_sync(frame: np.ndarray,
         anchors = session.pose_tracker.update(rgb)
         rgb.flags.writeable = True
 
-        # ── 0. Preview (throttled) ───────────────────────────────────────────
+        # -- 0. Preview (throttled) -------------------------------------------
         # Built here, inside the executor thread, so JPEG encoding never runs
         # on the event loop. Recognition below is unaffected by the throttle.
         if PREVIEW_ENABLED and want_preview:
             result_payload["preview"] = _encode_preview(frame, results)
 
-        # ── 1. Hand visibility ───────────────────────────────────────────────
+        # -- 1. Hand visibility -----------------------------------------------
         left_hand, right_hand = split_hands(results)
         has_any_hand = (left_hand is not None) or (right_hand is not None)
 
@@ -693,7 +713,7 @@ def process_frame_sync(frame: np.ndarray,
         # chin) cannot be told apart — worth surfacing to the user.
         result_payload["body_visible"] = bool(anchors.valid)
 
-        # ── 2. Distance feedback (now hand-based, Pose is gone) ─────────────
+        # -- 2. Distance feedback (now hand-based, Pose is gone) -------------
         distance = estimate_distance(results)
         if distance is not None:
             result_payload["messages"].append({
@@ -701,14 +721,28 @@ def process_frame_sync(frame: np.ndarray,
                 "distance": distance,
             })
 
-        # ── 3. Hybrid feature extraction (126 values per frame) ─────────────
+        # -- 3. Hybrid feature extraction (126 values per frame) -------------
         # Single source of truth: feature_extractor.extract_frame_features
         frame_features = extract_frame_features(results, anchors)
+
+        # -- Live mirror: stream bone directions to the avatar --------------
+        if session.mirror_live and has_any_hand:
+            now_t = time.monotonic()
+            if now_t >= session.mirror_next_at:
+                session.mirror_next_at = now_t + (1.0 / MIRROR_FPS)
+                try:
+                    result_payload["messages"].append({
+                        "type": "live_pose",
+                        "pose": frame_to_bone_dirs(frame_features),
+                        "body": bool(anchors.valid),
+                    })
+                except Exception as exc:
+                    print(f"[!]  live_pose failed: {type(exc).__name__}: {exc}")
 
         recognition_ready = onnx_session is not None and label_map is not None
 
         if RECOGNITION_MODE == "segmented":
-            # ── 4a. Event-driven: classify ONCE per detected gesture ───────
+            # -- 4a. Event-driven: classify ONCE per detected gesture -------
             # Pass a real timestamp so gesture DURATION is measured rather than
             # inferred — several signs differ only by how fast they are made.
             captured = session.segmenter.update(
@@ -725,7 +759,7 @@ def process_frame_sync(frame: np.ndarray,
                     "capturing": session.was_capturing,
                 })
 
-            # ── Practice mode: grade the attempt, don't translate it ───────
+            # -- Practice mode: grade the attempt, don't translate it -------
             # DTW compares raw pose trajectories, so it uses the resampled
             # sequence only — the global block is a classifier input.
             if sequence is not None and session.practice_target is not None:
@@ -768,7 +802,7 @@ def process_frame_sync(frame: np.ndarray,
                     })
 
         else:
-            # ── 4b. Legacy sliding window: re-classify every frame ─────────
+            # -- 4b. Legacy sliding window: re-classify every frame ---------
             session.frames_window.append(frame_features)
 
             if recognition_ready and len(session.frames_window) == SEQUENCE_LENGTH:
@@ -809,30 +843,30 @@ def process_frame_sync(frame: np.ndarray,
         if signature != _frame_error_state["signature"]:
             _frame_error_state["signature"] = signature
             _frame_error_state["count"] = 1
-            print(f"\n❌  Error processing frame: {signature}")
+            print(f"\n[FAIL]  Error processing frame: {signature}")
             traceback.print_exc()
             print(
-                "    → This will be reported every "
+                "    -> This will be reported every "
                 f"{_FRAME_ERROR_REPEAT_EVERY} occurrences while it persists.\n"
             )
         else:
             _frame_error_state["count"] += 1
             if _frame_error_state["count"] % _FRAME_ERROR_REPEAT_EVERY == 0:
                 print(
-                    f"❌  Error processing frame (still failing, "
+                    f"[FAIL]  Error processing frame (still failing, "
                     f"×{_frame_error_state['count']}): {signature}"
                 )
 
     return result_payload
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Async camera loop — the core background task
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Single-camera arbitration
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #
 # There is exactly ONE physical camera. Previously every client session built
 # its own SmartCamera, so a second client connecting and pressing "start"
@@ -875,7 +909,7 @@ async def camera_loop(ws, session: ClientSession) -> None:
 
     _camera_owner = session
 
-    cam  = SmartCamera(source=CAMERA_SOURCE)
+    cam  = SmartCamera(source=_active_camera_source)
     loop = asyncio.get_event_loop()
 
     cam.start()
@@ -930,7 +964,7 @@ async def camera_loop(ws, session: ClientSession) -> None:
                 except websockets.exceptions.ConnectionClosed:
                     pass      # client vanished; the loop will notice shortly
                 except Exception as exc:
-                    print(f"⚠️  preview send failed: {type(exc).__name__}: {exc}")
+                    print(f"[!]  preview send failed: {type(exc).__name__}: {exc}")
 
             # Emit any recognition events produced this frame (letter, pose_data)
             for msg in result["messages"]:
@@ -952,9 +986,9 @@ async def camera_loop(ws, session: ClientSession) -> None:
         print("[CameraLoop] Camera released.")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Camera task lifecycle helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 async def _stop_camera_task(session: ClientSession) -> None:
     """
@@ -971,15 +1005,15 @@ async def _stop_camera_task(session: ClientSession) -> None:
     except asyncio.CancelledError:
         pass      # expected: this is how the loop is asked to stop
     except Exception as exc:
-        print(f"⚠️  camera loop ended with an error: "
+        print(f"[!]  camera loop ended with an error: "
               f"{type(exc).__name__}: {exc}")
     finally:
         session.camera_task = None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  AI helpers (unchanged from original)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _clean_markdown(text: str) -> str:
     """Strip markdown formatting from AI reply text (for clean TTS input)."""
@@ -1031,13 +1065,13 @@ async def ask_turjuman_ai(user_question: str, history: list) -> str:
         return reply or "لا يوجد رد."
 
     except Exception as exc:
-        print(f"⚠️  AI request failed: {type(exc).__name__}: {exc}")
+        print(f"[!]  AI request failed: {type(exc).__name__}: {exc}")
         return "عُذراً، حَدَثَ خطَأْ في الاتِّصالِ."
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  TTS helper
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 async def generate_and_send_speech(text: str, ws) -> None:
     """
@@ -1055,12 +1089,12 @@ async def generate_and_send_speech(text: str, ws) -> None:
         if audio_data:
             await ws.send(bytes([BIN_AUDIO]) + bytes(audio_data))
         else:
-            print("⚠️  TTS produced no audio for the requested text.")
+            print("[!]  TTS produced no audio for the requested text.")
     except websockets.exceptions.ConnectionClosed:
         pass      # client disconnected while speech was being synthesised
     except Exception as exc:
         # TTS failing silently made the app look "mute" for no visible reason.
-        print(f"⚠️  TTS failed: {type(exc).__name__}: {exc}")
+        print(f"[!]  TTS failed: {type(exc).__name__}: {exc}")
         await send_to_client(ws, {
             "type":    "error",
             "code":    "tts_failed",
@@ -1068,9 +1102,9 @@ async def generate_and_send_speech(text: str, ws) -> None:
         })
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  STT helper — runs in executor thread
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 GROQ_STT_URL     = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_STT_MODEL   = "whisper-large-v3"
@@ -1109,21 +1143,21 @@ async def run_stt(audio_bytes: bytes, purpose: str, ws) -> None:
                     transcript = (payload.get("text") or "").strip()
                 else:
                     body = (await response.text())[:200]
-                    print(f"⚠️  Groq STT returned {response.status}: {body}")
+                    print(f"[!]  Groq STT returned {response.status}: {body}")
 
     except asyncio.TimeoutError:
-        print(f"⚠️  Groq STT timed out after {GROQ_STT_TIMEOUT}s")
+        print(f"[!]  Groq STT timed out after {GROQ_STT_TIMEOUT}s")
     except Exception as exc:
-        print(f"⚠️  Groq STT failed: {type(exc).__name__}: {exc}")
+        print(f"[!]  Groq STT failed: {type(exc).__name__}: {exc}")
 
     await send_to_client(
         ws, {"type": "stt_result", "purpose": purpose, "value": transcript}
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  WebSocket connection handler
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 async def register(websocket) -> None:
     """
@@ -1131,13 +1165,13 @@ async def register(websocket) -> None:
 
     Control flow
     ------------
-    • start_camera  → launch camera_loop as an asyncio Task (one at a time)
-    • stop_camera   → cancel + await the Task; camera released in finally
-    • speak         → fire-and-forget TTS task
-    • user_question → fire-and-forget AI query task
-    • Binary 0x01   → STT for translation (executor thread)
-    • Binary 0x02   → STT for chat (executor thread)
-    • Disconnect    → finally block cancels camera task + closes Hands
+    • start_camera  -> launch camera_loop as an asyncio Task (one at a time)
+    • stop_camera   -> cancel + await the Task; camera released in finally
+    • speak         -> fire-and-forget TTS task
+    • user_question -> fire-and-forget AI query task
+    • Binary 0x01   -> STT for translation (executor thread)
+    • Binary 0x02   -> STT for chat (executor thread)
+    • Disconnect    -> finally block cancels camera task + closes Hands
     """
     session = ClientSession(websocket)
     loop    = asyncio.get_event_loop()
@@ -1145,7 +1179,7 @@ async def register(websocket) -> None:
     try:
         async for raw_msg in websocket:
 
-            # ── Binary protocol (audio only) ─────────────────────────────────
+            # -- Binary protocol (audio only) ---------------------------------
             if isinstance(raw_msg, bytes):
                 header  = raw_msg[0]
                 payload = raw_msg[1:]
@@ -1155,14 +1189,14 @@ async def register(websocket) -> None:
                     asyncio.create_task(run_stt(payload, "chat", websocket))
                 continue
 
-            # ── JSON text protocol ───────────────────────────────────────────
+            # -- JSON text protocol -------------------------------------------
             try:
                 msg      = json.loads(raw_msg)
                 msg_type = msg.get("type", "")
             except (json.JSONDecodeError, Exception):
                 continue
 
-            # ── Camera control commands ──────────────────────────────────────
+            # -- Camera control commands --------------------------------------
             if msg_type == "start_camera":
                 # Guard: only one camera loop per session at a time
                 if session.camera_task and not session.camera_task.done():
@@ -1173,12 +1207,84 @@ async def register(websocket) -> None:
                     camera_loop(websocket, session)
                 )
 
+            elif msg_type == "list_cameras":
+                # Probing device indices takes a second or two and blocks, so
+                # it runs off the event loop — otherwise the whole app freezes
+                # while it scans, including the preview stream.
+                await send_to_client(websocket, {"type": "camera_scan_started"})
+                loop_ = asyncio.get_event_loop()
+                try:
+                    found = await loop_.run_in_executor(None, describe_cameras)
+                except Exception as exc:
+                    print(f"[!]  camera scan failed: {type(exc).__name__}: {exc}")
+                    found = []
+
+                options = []
+                for cam in found:
+                    # Windows supplies the real product name; where it does not,
+                    # fall back to the index heuristic rather than inventing one.
+                    integrated = cam["kind"] == "integrated"
+                    options.append({
+                        "source": str(cam["index"]),
+                        "label":  ("الكاميرا المدمجة" if integrated
+                                   else "كاميرا USB خارجية"),
+                        "detail": (f"{cam['name']} — {cam['width']}×{cam['height']}"
+                                   if cam.get("name")
+                                   else f"index {cam['index']} — "
+                                        f"{cam['width']}×{cam['height']}"),
+                        "kind":   cam["kind"],
+                    })
+                options.append({
+                    "source": droidcam_url(),
+                    "label":  "الهاتف (DroidCam)",
+                    "detail": droidcam_url(),
+                    "kind":   "network",
+                })
+                options.append({
+                    "source": "auto",
+                    "label":  "اختيار تلقائي",
+                    "detail": "يجرِّب المتاح بالترتيب",
+                    "kind":   "auto",
+                })
+
+                await send_to_client(websocket, {
+                    "type":    "camera_list",
+                    "cameras": options,
+                    "active":  str(_active_camera_source),
+                })
+
+            elif msg_type == "set_camera":
+                # Switching source means reopening the device. If the camera is
+                # live it is stopped and restarted, so the user sees the new
+                # feed immediately instead of having to toggle it themselves.
+                new_source = str(msg.get("source", "")).strip()
+                if not new_source:
+                    continue
+
+                was_running = bool(session.camera_task
+                                   and not session.camera_task.done())
+                if was_running:
+                    await _stop_camera_task(session)
+
+                globals()["_active_camera_source"] = new_source
+                print(f"[register] camera source -> {new_source}")
+
+                await send_to_client(websocket, {
+                    "type":   "camera_source_changed",
+                    "source": new_source,
+                })
+
+                if was_running:
+                    session.camera_task = asyncio.create_task(
+                        camera_loop(websocket, session)
+                    )
+
             elif msg_type == "stop_camera":
                 print("[register] stop_camera received — shutting down loop.")
                 await _stop_camera_task(session)
 
-            # ── Other commands ───────────────────────────────────────────────
-            # ── Practice mode control ────────────────────────────────────────
+            # -- Other commands -----------------------------------------------
+            # -- Practice mode control ----------------------------------------
             elif msg_type == "start_practice":
                 target = str(msg.get("target", "")).strip()
                 if target in dtw_library.references:
@@ -1214,6 +1320,17 @@ async def register(websocket) -> None:
                     ],
                 })
 
+            elif msg_type == "start_mirror":
+                session.mirror_live = True
+                session.mirror_next_at = 0.0
+                print("[register] Live mirror ON")
+                await send_to_client(websocket, {"type": "mirror_state", "active": True})
+
+            elif msg_type == "stop_mirror":
+                session.mirror_live = False
+                print("[register] Live mirror OFF")
+                await send_to_client(websocket, {"type": "mirror_state", "active": False})
+
             elif msg_type == "speak":
                 text = msg.get("value", "").strip()
                 if text:
@@ -1239,16 +1356,25 @@ async def register(websocket) -> None:
         session.close()                     # release MediaPipe Hands
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Entry point
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 async def main() -> None:
+    # Ask BEFORE the server starts listening. The desktop app waits on port
+    # 8765, so it simply waits through the prompt instead of opening against a
+    # camera the user has not chosen yet.
+    #
+    # Skipped automatically when CAMERA_SOURCE is set in .env, or when there is
+    # no terminal attached — see choose_camera_interactive().
+    global _active_camera_source
+    _active_camera_source = choose_camera_interactive()
+
     print("=" * 60)
     print("  Tarjuman WebSocket Server — Headless Camera Mode")
     print(f"  ws://{BIND_HOST}:{BIND_PORT}")
     print("  Access : LOCAL ONLY (loopback — not reachable from the network)")
-    print(f"  Camera : {CAMERA_SOURCE}  (managed by backend)")
+    print(f"  Camera : {_active_camera_source}  (changeable from the app)")
     print("  Video  : DISABLED (zero-bandwidth architecture)")
     print("=" * 60)
 
@@ -1259,7 +1385,7 @@ async def main() -> None:
         ping_interval=30,
         ping_timeout=10,
     )
-    print("RDDY✅")
+    print("RDDY[OK]")
     await server.wait_closed()
 
 

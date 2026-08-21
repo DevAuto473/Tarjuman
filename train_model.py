@@ -9,10 +9,10 @@ Raspberry Pi.
 Pipeline overview
 -----------------
   1. Load  `dynamic_gestures.csv`  (col 0 = label, cols 1–9000 = features)
-  2. Encode string labels → integers with LabelEncoder
+  2. Encode string labels -> integers with LabelEncoder
   3. Split 80 / 20 stratified train / test
   4. Augment training data with Gaussian jitter (simulates hand tremor)
-  5. Build  StandardScaler → RandomForest(150 trees, depth 20)
+  5. Build  StandardScaler -> RandomForest(150 trees, depth 20)
   6. Evaluate: accuracy, classification report, confusion matrix PNG
   7. Export: sign_model.onnx  +  labels.json
 """
@@ -24,11 +24,6 @@ import time
 
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")                       # headless backend — no GUI needed
-import matplotlib.pyplot as plt
-import seaborn as sns
-
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     accuracy_score,
@@ -39,15 +34,14 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
-from skl2onnx import convert_sklearn
-from skl2onnx.common.data_types import FloatTensorType
+from onnx_export import export_pipeline
 
 
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Configuration
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 INPUT_CSV       = os.environ.get("TARJUMAN_CSV", "dynamic_gestures_v4.csv")
 PKL_MODEL_PATH  = "sign_model.pkl"     # dev / inspection only
@@ -60,7 +54,7 @@ N_ESTIMATORS = 150
 MAX_DEPTH    = 20
 RANDOM_STATE = 42
 
-# ── Augmentation ─────────────────────────────────────────────────────────────
+# -- Augmentation -------------------------------------------------------------
 NOISE_STDDEV = 0.005          # Gaussian jitter σ  (relative to landmark scale ≈ 0–1)
 
 # Temporal augmentation — simulates the SAME sign performed at different speeds.
@@ -77,9 +71,9 @@ from feature_extractor import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Helper: Gaussian noise augmentation
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def augment_with_jitter(X: np.ndarray, y: np.ndarray,
                         noise_std: float = NOISE_STDDEV) -> tuple:
@@ -109,9 +103,9 @@ def augment_with_jitter(X: np.ndarray, y: np.ndarray,
     return X_aug, y_aug
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Helper: temporal augmentation (speed invariance)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _split_blocks(X: np.ndarray):
     """
@@ -199,9 +193,9 @@ def augment_frame_dropout(X: np.ndarray, y: np.ndarray, rng) -> tuple:
     return _join_blocks(out, globals_.copy()), y.copy()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Helper: Pretty confusion-matrix heatmap
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def report_confusions(y_true, y_pred, class_names, top_n: int = 12) -> None:
     """
@@ -230,7 +224,7 @@ def report_confusions(y_true, y_pred, class_names, top_n: int = 12) -> None:
     pairs.sort(reverse=True)
     for both, support, a, b in pairs[:top_n]:
         rate = both / support * 100 if support else 0.0
-        print(f"       {a}  ↔  {b}   —  {both} errors ({rate:.0f}% of their samples)")
+        print(f"       {a}  <->  {b}   —  {both} errors ({rate:.0f}% of their samples)")
 
     if len(pairs) > top_n:
         print(f"       ... and {len(pairs) - top_n} more pairs")
@@ -242,6 +236,15 @@ def save_confusion_matrix(y_true, y_pred, class_names, path: str):
     Build and save a publication-quality confusion-matrix heatmap.
     Uses a modern dark colour palette for maximum readability.
     """
+    # Imported here, not at the top. Matplotlib and seaborn drag in a large
+    # native stack that the TRAINING does not need, and if that stack is what
+    # crashes the interpreter, deferring it means the model is already saved by
+    # the time anything goes wrong.
+    import matplotlib
+    matplotlib.use("Agg")          # no GUI backend: this runs headless
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
     cm = confusion_matrix(y_true, y_pred)
 
     fig, ax = plt.subplots(figsize=(max(8, len(class_names) * 0.75),
@@ -279,13 +282,169 @@ def save_confusion_matrix(y_true, y_pred, class_names, path: str):
 #  Main pipeline
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _step(n: int, total: int, title: str) -> float:
+    """Print a numbered step header and return its start time."""
+    bar = "#" * n + "." * (total - n)
+    print(f"\n[{bar}] {n}/{total}  {title}")
+    return time.perf_counter()
+
+
+def _done(t_start: float) -> None:
+    print(f"        ...done in {time.perf_counter() - t_start:.2f}s")
+
+
+def _write_bytes(path: str, data: bytes) -> None:
+    """
+    Write a model file safely, and explain the one failure that looks like
+    nothing happening at all.
+
+    Windows locks a file while another process has it open. The server keeps an
+    ONNX session on sign_model.onnx for the whole time it runs, so training
+    while `npm run dev:all` is up cannot replace it: the write raises
+    PermissionError, the traceback scrolls past, and the user sees stale files
+    with yesterday's timestamp and concludes that training "did nothing".
+
+    Writing to a temporary file first also means a failed write can no longer
+    destroy the model that was already working.
+    """
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    try:
+        os.replace(tmp, path)
+    except PermissionError:
+        os.remove(tmp)
+        print(f"\n[FAIL] Cannot write {path} - the file is in use.")
+        print("       On Windows the running server holds the model open.")
+        print("       Stop it (Ctrl-C in the `npm run dev:all` terminal),")
+        print("       then run `npm run train` again.")
+        print("       Your previous model was left untouched.")
+        sys.exit(1)
+
+
+def preflight(csv_path: str) -> None:
+    """
+    Refuse to train on data that cannot produce a usable model.
+
+    Training happily "succeeds" on one class and reports 100 % accuracy, which
+    is meaningless — there is nothing to choose between. Catching that here,
+    with an explanation, beats shipping a model that always answers the same
+    word.
+    """
+    print("\n" + "=" * 65)
+    print("   PRE-FLIGHT CHECKS")
+    print("=" * 65)
+
+    if not os.path.isfile(csv_path):
+        print(f"\n[FAIL] Dataset not found: {csv_path}")
+        print("       Record some samples first:  npm run collect")
+        sys.exit(1)
+
+    size_mb = os.path.getsize(csv_path) / (1024 * 1024)
+    print(f"   dataset      : {csv_path}  ({size_mb:.1f} MB)")
+
+    # Count classes without loading the whole file into memory twice
+    import csv as _csv
+    counts = {}
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = _csv.reader(f)
+        header = next(reader, None)
+        for row in reader:
+            if row and row[0]:
+                counts[row[0]] = counts.get(row[0], 0) + 1
+
+    if header is None or not counts:
+        print("\n[FAIL] Dataset is empty.")
+        sys.exit(1)
+
+    expected_cols = TOTAL_FEATURES + 1
+    if len(header) != expected_cols:
+        print(f"\n[FAIL] Column count mismatch: found {len(header)}, "
+              f"expected {expected_cols}.")
+        print("       The dataset was recorded with a DIFFERENT feature layout.")
+        print("       Re-record with the current code, or migrate the old file.")
+        sys.exit(1)
+    print(f"   columns      : {len(header)}  (matches TOTAL_FEATURES) [OK]")
+
+    total = sum(counts.values())
+    smallest = min(counts.values())
+    print(f"   samples      : {total}")
+    print(f"   classes      : {len(counts)}")
+
+    # Show the distribution — imbalance is the usual reason a model looks fine
+    # on paper and fails in the room.
+    for name, n in sorted(counts.items(), key=lambda kv: kv[1]):
+        flag = "  <- too few" if n < 10 else ""
+        print(f"       {name:<20s} {n:>4d}{flag}")
+
+    if len(counts) < 2:
+        print("\n[FAIL] Only ONE class in the dataset.")
+        print("       A classifier needs at least two things to choose between.")
+        print("       It would train, report 100 % accuracy, and always answer")
+        print("       the same word — which is worse than not training at all.")
+        print("\n       Record a second term:  npm run collect")
+        sys.exit(1)
+
+    if smallest < 5:
+        print(f"\n[FAIL] Smallest class has {smallest} sample(s).")
+        print("       The train/test split cannot be stratified below 5.")
+        sys.exit(1)
+
+    if smallest < 20:
+        print(f"\n[WARN] Smallest class has only {smallest} samples "
+              f"(recommended: 30+).")
+        print("       Expect the model to memorise rather than generalise.")
+
+    print("\n   [OK] pre-flight passed")
+
+
+def verify_outputs() -> bool:
+    """
+    Confirm the artifacts actually exist on disk after export.
+
+    An export can fail in ways that leave the console looking successful — a
+    permissions error, a full disk, a path typo. Checking the files afterwards
+    turns "I don't see sign_model.onnx" into an answer instead of a mystery.
+    """
+    print("\n" + "=" * 65)
+    print("   OUTPUT VERIFICATION")
+    print("=" * 65)
+
+    expected = [
+        (ONNX_MODEL_PATH, "used by the server"),
+        (PKL_MODEL_PATH,  "development only"),
+        (LABELS_JSON,     "class name map"),
+        (CM_IMAGE,        "confusion matrix"),
+    ]
+    ok = True
+    for path, note in expected:
+        if os.path.isfile(path):
+            kb = os.path.getsize(path) / 1024
+            when = time.strftime("%H:%M:%S", time.localtime(os.path.getmtime(path)))
+            print(f"   [OK]   {path:<24s} {kb:>8.1f} KB   {when}   ({note})")
+        else:
+            print(f"   [FAIL] {path:<24s} NOT CREATED   ({note})")
+            ok = False
+
+    print()
+    if ok:
+        print(f"   Full path: {os.path.abspath(ONNX_MODEL_PATH)}")
+        print("   Start the app with:  npm run dev:all")
+    else:
+        print("   Some artifacts were not written. Check the errors above,")
+        print("   and that the folder is writable and not full.")
+    return ok
+
+
 def main():
     t0 = time.perf_counter()
     print("=" * 65)
     print("   Tarjuman - Dynamic Gesture Training Pipeline")
     print("=" * 65)
 
-    # ── Step 1: Load CSV ────────────────────────────────────────────────────
+    preflight(INPUT_CSV)
+
+    # -- Step 1: Load CSV ----------------------------------------------------
     print("\n[1/7] Loading data from", INPUT_CSV)
 
     if not os.path.isfile(INPUT_CSV):
@@ -301,21 +460,21 @@ def main():
         print(f"\n[WARN] Column count ({df.shape[1]}) != expected ({expected_cols}).")
         print("       Continuing with the data as-is.")
 
-    labels_raw = df.iloc[:, 0].values       # first column  → labels
-    features   = df.iloc[:, 1:].values      # remaining cols → float features
+    labels_raw = df.iloc[:, 0].values       # first column  -> labels
+    features   = df.iloc[:, 1:].values      # remaining cols -> float features
 
     print(f"   samples      : {len(df):,}")
     print(f"   columns      : {df.shape[1]:,}  (1 label + {df.shape[1] - 1} features)")
     print(f"   classes      : {np.unique(labels_raw).tolist()}")
 
-    # ── Step 2: Encode labels ───────────────────────────────────────────────
+    # -- Step 2: Encode labels -----------------------------------------------
     print("\n[2/7] Encoding labels (LabelEncoder)")
     le = LabelEncoder()
     y = le.fit_transform(labels_raw)
     class_names = le.classes_.tolist()
-    print(f"   └─  {len(class_names)} classes -> {class_names}")
+    print(f"   `--  {len(class_names)} classes -> {class_names}")
 
-    # ── Step 3: Train / test split ──────────────────────────────────────────
+    # -- Step 3: Train / test split ------------------------------------------
     print("\n[3/7] Train/test split (80% / 20%)")
     X_train, X_test, y_train, y_test = train_test_split(
         features, y,
@@ -326,8 +485,9 @@ def main():
     print(f"   train : {X_train.shape[0]:,} samples")
     print(f"   test  : {X_test.shape[0]:,} samples")
 
-    # ── Step 4: Data augmentation ───────────────────────────────────────────
-    print(f"\n[4/7] Augmentation (spatial + temporal)")
+    # -- Step 4: Data augmentation -------------------------------------------
+    print(f"\n[####...] 4/7  Augmentation (spatial + temporal)" if False else f"\n[####...] 4/7  Augmentation (spatial + temporal)")
+    print(f"")
     original_count = X_train.shape[0]
     rng = np.random.default_rng(seed=RANDOM_STATE)
 
@@ -363,9 +523,10 @@ def main():
     print(f"   total            : {X_train.shape[0]:,}  "
           f"(×{X_train.shape[0] / max(original_count, 1):.0f})")
 
-    # ── Step 5: Build & train pipeline ──────────────────────────────────────
-    print(f"\n[5/7] Building and training the pipeline")
-    print(f"         StandardScaler → RandomForest(n={N_ESTIMATORS}, depth={MAX_DEPTH})")
+    # -- Step 5: Build & train pipeline --------------------------------------
+    print(f"\n[#####..] 5/7  Building and training the pipeline" if False else f"\n[#####..] 5/7  Building and training the pipeline")
+    print(f"")
+    print(f"         StandardScaler -> RandomForest(n={N_ESTIMATORS}, depth={MAX_DEPTH})")
 
     pipeline = Pipeline([
         ("scaler", StandardScaler()),
@@ -382,7 +543,7 @@ def main():
     elapsed_train = time.perf_counter() - t_train
     print(f"   trained in {elapsed_train:.1f}s")
 
-    # ── Step 6: Evaluate ────────────────────────────────────────────────────
+    # -- Step 6: Evaluate ----------------------------------------------------
     print("\n[6/7] Evaluating on the held-out test set")
     y_pred   = pipeline.predict(X_test)
     accuracy = accuracy_score(y_test, y_pred)
@@ -394,52 +555,54 @@ def main():
         zero_division=0,
     ))
 
-    # Confusion matrix → PNG
-    save_confusion_matrix(y_test, y_pred, class_names, CM_IMAGE)
+    # Confusion matrix -> PNG
+    # A picture is a nicety; the model is the point. Losing the run because a
+    # plotting backend misbehaved would be an absurd trade.
+    try:
+        save_confusion_matrix(y_test, y_pred, class_names, CM_IMAGE)
+    except Exception as exc:
+        print(f"   [!] Confusion matrix skipped ({type(exc).__name__}: {exc})")
+        print("       Training continues - this affects no output the app uses.")
 
-    # ── Which pairs actually get confused? ──────────────────────────────────
+    # -- Which pairs actually get confused? ----------------------------------
     # A single accuracy number hides the thing that matters most here: WHICH
     # signs the model mixes up. With a vocabulary full of near-identical
     # gestures, the confusable pairs are the whole story — they tell you which
     # signs need redesigning or more samples, instead of guessing.
     report_confusions(y_test, y_pred, class_names)
 
-    # ── Step 7: Export ONNX (production) + PKL (dev) + labels.json ─────────
-    print(f"\n[7/7] Exporting ONNX + PKL + labels.json")
+    # -- Step 7: Export ONNX (production) + PKL (dev) + labels.json ---------
+    print(f"\n[#######] 7/7  Exporting ONNX + PKL + labels.json" if False else f"\n[#######] 7/7  Exporting ONNX + PKL + labels.json")
+    print(f"")
 
-    # ── 7a. PKL — kept for local inspection/debugging only ─────────────────
+    # -- 7a. PKL — kept for local inspection/debugging only -----------------
     import pickle
-    with open(PKL_MODEL_PATH, "wb") as f:
-        pickle.dump(pipeline, f)
+    _write_bytes(PKL_MODEL_PATH, pickle.dumps(pipeline))
 
     pkl_size = os.path.getsize(PKL_MODEL_PATH) / (1024 * 1024)
     print(f"   [OK] {PKL_MODEL_PATH}  ({pkl_size:.1f} MB)  (development only)")
 
-    # ── 7b. ONNX — the artifact the server actually runs ───────────────────
+    # -- 7b. ONNX — the artifact the server actually runs -------------------
     # Why ONNX: sklearn's predict_proba carries heavy Python/joblib overhead
     # per call (~22.7 ms/frame measured). ONNX Runtime executes the same forest
     # as a single compiled TreeEnsemble op (~0.04 ms/frame) — a ~546× speedup,
     # which matters enormously on a Raspberry Pi.
     #
-    # zipmap=False is CRITICAL: without it the probabilities output is a list
-    # of dicts (ZipMap), which is slow to build and awkward to consume.
-    # With it, we get a clean (N, n_classes) float32 array.
+    # Built here rather than by skl2onnx, which crashes the interpreter
+    # outright (0xC0000005) on the development machine - a native fault no
+    # try/except can catch, so training could never reach this step. The graph
+    # needed is two standard ai.onnx.ml operators, so `onnx` alone can emit it,
+    # and the parity check below is what keeps that honest.
     #
-    # Batch dimension is None so the same file works for single-frame
-    # inference (server) and batched evaluation (offline testing).
-    initial_type = [("input", FloatTensorType([None, TOTAL_FEATURES]))]
-    onnx_model = convert_sklearn(
-        pipeline,
-        initial_types=initial_type,
-        options={"clf": {"zipmap": False}},
-    )
-    with open(ONNX_MODEL_PATH, "wb") as f:
-        f.write(onnx_model.SerializeToString())
+    # The batch dimension stays dynamic so one file serves single-frame
+    # inference on the server and batched evaluation offline.
+    onnx_bytes = export_pipeline(pipeline, TOTAL_FEATURES)
+    _write_bytes(ONNX_MODEL_PATH, onnx_bytes)
 
     onnx_size = os.path.getsize(ONNX_MODEL_PATH) / (1024 * 1024)
     print(f"   [OK] {ONNX_MODEL_PATH}  ({onnx_size:.1f} MB)  (production)")
 
-    # ── 7c. Verify ONNX output matches sklearn before trusting it ──────────
+    # -- 7c. Verify ONNX output matches sklearn before trusting it ----------
     # A silent numerical divergence here would be very hard to debug later,
     # so we assert parity on the held-out test set at export time.
     try:
@@ -466,7 +629,7 @@ def main():
     except ImportError:
         print("   [WARN] onnxruntime not installed - parity check skipped.")
 
-    # ── 7d. Class mapping  { "0": "Alef", "1": "Beh", … } ──────────────────
+    # -- 7d. Class mapping  { "0": "Alef", "1": "Beh", … } ------------------
     # LabelEncoder guarantees integer classes 0..n-1 in sorted order, so the
     # column index of the ONNX probabilities output maps directly to this key.
     label_map = {str(i): name for i, name in enumerate(class_names)}
@@ -474,7 +637,7 @@ def main():
         json.dump(label_map, f, ensure_ascii=False, indent=2)
     print(f"   [OK] {LABELS_JSON}  ({len(label_map)} classes)")
 
-    # ── Done ────────────────────────────────────────────────────────────────
+    # -- Done ----------------------------------------------------------------
     total = time.perf_counter() - t0
     print("\n" + "=" * 65)
     print(f"   Done in {total:.1f}s")
@@ -486,4 +649,23 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Nothing may fail invisibly. Without this, an exception anywhere in the
+    # pipeline prints a traceback that scrolls off, or - worse - dies while
+    # encoding its own output and leaves the terminal blank.
+    try:
+        main()
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        print("\n[stop] Interrupted - nothing was written.")
+        sys.exit(130)
+    except Exception as exc:
+        import traceback
+        print("\n" + "=" * 65)
+        print("   TRAINING FAILED")
+        print("=" * 65)
+        print(f"   {type(exc).__name__}: {exc}")
+        print("\n   Full traceback:")
+        traceback.print_exc()
+        print("\n   Copy everything above when reporting this.")
+        sys.exit(1)

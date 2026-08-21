@@ -31,6 +31,7 @@ import os
 import numpy as np
 
 from feature_extractor import (
+    FRAME_FEATURES,
     SEQUENCE_LENGTH,
     TOTAL_FEATURES,
     VALS_PER_FRAME,
@@ -38,9 +39,9 @@ from feature_extractor import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Tuning
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 # Sakoe-Chiba band: how far the alignment may drift from the diagonal, as a
 # fraction of sequence length. Without a band, DTW can align a wild attempt to
@@ -48,7 +49,7 @@ from feature_extractor import (
 # algorithm meaningfully faster.
 WARP_BAND_RATIO = 0.25
 
-# Maps raw DTW distance → 0-100 score. Distance at which the score hits ~37 %.
+# Maps raw DTW distance -> 0-100 score. Distance at which the score hits ~37 %.
 # Calibrate against real recordings of correct vs. deliberately wrong attempts.
 SCORE_DECAY = 0.55
 
@@ -59,9 +60,9 @@ WRIST_WEIGHT = 0.4
 SHAPE_WEIGHT = 1.0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Core DTW
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _frame_distance_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """
@@ -80,7 +81,7 @@ def _frame_distance_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     aw = a * weights
     bw = b * weights
 
-    # (len(a), 1, F) - (1, len(b), F) → pairwise differences
+    # (len(a), 1, F) - (1, len(b), F) -> pairwise differences
     diff = aw[:, None, :] - bw[None, :, :]
     return np.sqrt(np.sum(diff * diff, axis=2))
 
@@ -141,9 +142,9 @@ def similarity_score(distance: float, decay: float = SCORE_DECAY) -> float:
     return float(round(100.0 * np.exp(-distance / decay), 1))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Reference library
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 class SignReferenceLibrary:
     """
@@ -156,7 +157,7 @@ class SignReferenceLibrary:
     def __init__(self):
         self.references: dict[str, np.ndarray] = {}
 
-    # ── Construction ────────────────────────────────────────────────────────
+    # -- Construction --------------------------------------------------------
 
     @classmethod
     def from_csv(cls, path: str) -> "SignReferenceLibrary":
@@ -170,7 +171,7 @@ class SignReferenceLibrary:
         """
         lib = cls()
         if not os.path.isfile(path):
-            print(f"⚠️  DTW reference CSV not found: {path}")
+            print(f"[!]  DTW reference CSV not found: {path}")
             return lib
 
         by_label: dict[str, list[np.ndarray]] = {}
@@ -186,18 +187,24 @@ class SignReferenceLibrary:
                     values = np.asarray(row[1:], dtype=np.float32)
                 except ValueError:
                     continue
+
+                # A CSV row is [per-frame block | global block]. DTW compares
+                # pose trajectories frame by frame, so only the per-frame block
+                # is reshapeable — the globals (duration, tempo, direction) are
+                # whole-gesture summaries with no time axis and belong to the
+                # classifier, not to this comparison.
                 by_label.setdefault(label, []).append(
-                    values.reshape(SEQUENCE_LENGTH, VALS_PER_FRAME)
+                    values[:FRAME_FEATURES].reshape(SEQUENCE_LENGTH, VALS_PER_FRAME)
                 )
 
         for label, samples in by_label.items():
             lib.references[label] = _medoid(samples)
 
-        print(f"✅  DTW references loaded: {len(lib.references)} sign(s) "
+        print(f"[OK]  DTW references loaded: {len(lib.references)} sign(s) "
               f"from {os.path.basename(path)}")
         return lib
 
-    # ── Scoring ─────────────────────────────────────────────────────────────
+    # -- Scoring -------------------------------------------------------------
 
     def score(self, label: str, attempt: np.ndarray) -> dict | None:
         """

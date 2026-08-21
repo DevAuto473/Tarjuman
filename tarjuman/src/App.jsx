@@ -3,7 +3,11 @@ import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { useGLTF, useAnimations } from '@react-three/drei';
 import { useSignPlayer } from './signing/useSignPlayer';
 import { tokenise, AVAILABLE_SIGNS } from './signing/dictionary';
-import { SlidersHorizontal, LogOut, Settings, X, Send, Sparkles, Delete, Mic, MicOff, Volume2, Hand } from 'lucide-react';
+import {
+  loadTrainedSigns, trainedList, findTrainedSign,
+} from './signing/trainedSigns';
+import CalibrationPanel from './signing/CalibrationPanel';
+import { SlidersHorizontal, LogOut, Settings, X, Send, Sparkles, Delete, Mic, MicOff, Volume2, Hand, Camera, RefreshCw, Check } from 'lucide-react';
 import './App.css';
 
 const styles = `
@@ -214,6 +218,23 @@ export default function App() {
   const [previewUrl, setPreviewUrl] = useState(null);
   // Text the user wants the robot to perform as sign language.
   const [signInput, setSignInput] = useState('');
+  // Signs derived from the user's own recordings (npm run export3d).
+  const [trained, setTrained] = useState([]);
+  const [showTrained, setShowTrained] = useState(false);
+  const [playingId, setPlayingId] = useState(null);
+  const [showCalib, setShowCalib] = useState(false);
+  const [mirrorOn, setMirrorOn] = useState(false);
+  // Camera chooser: which devices the backend can see, and which it is using.
+  const [showCamPicker, setShowCamPicker] = useState(false);
+  const [camList, setCamList] = useState([]);
+  const [camScanning, setCamScanning] = useState(false);
+  const [camActive, setCamActive] = useState(null);
+  const [micPermission, setMicPermission] = useState(null);
+
+  // Load once on mount; a missing file just means nothing is exported yet.
+  useEffect(() => {
+    loadTrainedSigns().then(() => setTrained(trainedList()));
+  }, []);
   const [translatedText, setTranslatedText] = useState('');
   const [showAiModal, setShowAiModal] = useState(false);
   const [showLearnModal, setShowLearnModal] = useState(false);
@@ -293,6 +314,20 @@ export default function App() {
           setHandsVisible((prev) => (prev === nextHands ? prev : nextHands));
         } else if (msg.type === 'letter') {
           setTranslatedText((prev) => prev + msg.value);
+        } else if (msg.type === 'camera_scan_started') {
+          setCamScanning(true);
+        } else if (msg.type === 'camera_list') {
+          setCamList(msg.cameras || []);
+          setCamActive(msg.active ?? null);
+          setCamScanning(false);
+        } else if (msg.type === 'camera_source_changed') {
+          setCamActive(msg.source);
+        } else if (msg.type === 'live_pose') {
+          // Live mirror: drive the avatar straight from the newest frame.
+          signerRef.current?.applyLivePose(msg.pose);
+        } else if (msg.type === 'mirror_state') {
+          setMirrorOn(Boolean(msg.active));
+          if (!msg.active) signerRef.current?.clearLivePose();
         } else if (msg.type === 'capture_state') {
           setCapturing(Boolean(msg.capturing));
         } else if (msg.type === 'stt_result') {
@@ -399,8 +434,14 @@ export default function App() {
     if (!player || !text?.trim()) return;
 
     const tokens = tokenise(text);
-    const known = tokens.filter((t) => t.sign);
-    const unknown = tokens.filter((t) => !t.sign).map((t) => t.word);
+    // A recorded sign beats a hand-authored estimate: it is how a person
+    // actually moved, not how someone guessed the angles.
+    const resolved = tokens.map((t) => {
+      const recorded = findTrainedSign(t.word);
+      return recorded ? { ...t, sign: recorded } : t;
+    });
+    const known = resolved.filter((t) => t.sign);
+    const unknown = resolved.filter((t) => !t.sign).map((t) => t.word);
 
     if (known.length === 0) {
       setNotice({ kind: 'warn', text: 'لا توجد إشارات معروفة في هذا النص' });
@@ -658,6 +699,59 @@ export default function App() {
                 </div>
               </div>
 
+              {/* Everything the recogniser has been taught, playable on the
+                  avatar. Populated by `npm run export3d`. */}
+              {/* Re-pick the camera without restarting anything. The camera is
+                  opened by the BACKEND, not by the browser, so there is no
+                  getUserMedia prompt to re-trigger for video — the real choice
+                  is which device the server opens. */}
+              <button
+                onClick={() => {
+                  setShowCamPicker(true);
+                  setCamList([]);
+                  send({ type: 'list_cameras' });
+                  // The mic IS a browser permission, so report its real state.
+                  navigator.permissions?.query({ name: 'microphone' })
+                    .then((r) => setMicPermission(r.state))
+                    .catch(() => setMicPermission(null));
+                }}
+                className="w-full max-w-[200px] py-2.5 text-sm font-bold rounded-2xl bg-zinc-700 hover:bg-zinc-600 transition cursor-pointer shadow-lg flex items-center justify-center gap-2"
+              >
+                <Camera className="w-4 h-4" />
+                إعادة صلاحيات الكاميرا
+              </button>
+
+              {/* Live mirror: the robot copies you in real time. The fastest
+                  way to see whether the derivation is right — no export, no
+                  reload, just move and watch. */}
+              <button
+                onClick={() => {
+                  const next = !mirrorOn;
+                  setMirrorOn(next);
+                  send({ type: next ? 'start_mirror' : 'stop_mirror' });
+                  if (!next) signerRef.current?.clearLivePose();
+                }}
+                disabled={!cameraOn}
+                className={`w-full max-w-[200px] py-3 text-base font-bold rounded-2xl transition cursor-pointer shadow-lg flex items-center justify-center gap-2 disabled:opacity-30 disabled:cursor-not-allowed ${mirrorOn
+                  ? 'bg-purple-600 hover:bg-purple-500'
+                  : 'bg-zinc-700 hover:bg-zinc-600'
+                  }`}
+              >
+                <Hand className="w-5 h-5" />
+                {mirrorOn ? 'إيقاف المرآة الحية' : 'مرآة حية'}
+              </button>
+
+              <button
+                onClick={() => setShowTrained(true)}
+                className="bg-emerald-700 hover:bg-emerald-600 w-full max-w-[200px] py-3 text-base font-bold rounded-2xl transition cursor-pointer shadow-lg flex items-center justify-center gap-2"
+              >
+                <Hand className="w-5 h-5" />
+                الإشارات المدرَّبة
+                <span className="bg-emerald-900/70 text-emerald-200 text-xs px-2 py-0.5 rounded-full">
+                  {trained.length}
+                </span>
+              </button>
+
               <button
                 onClick={() => setShowLearnModal(true)}
                 className="bg-blue-600 hover:bg-blue-700 w-full max-w-[200px] h-[70px] text-xl font-bold rounded-2xl transition cursor-pointer shadow-lg flex items-center justify-center text-center"
@@ -750,6 +844,210 @@ export default function App() {
             )}
           </div>
         </div>
+      )}
+
+      {/* ══ Trained Signs Browser ═════════════════════════════════════════ */}
+      {showCamPicker && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4" dir="rtl">
+          <div className="bg-[#111827] border border-white/10 rounded-2xl w-full max-w-lg p-5 flex flex-col gap-4 shadow-2xl">
+            <div className="flex justify-between items-center border-b border-white/10 pb-3">
+              <div className="flex items-center gap-2">
+                <Camera className="w-5 h-5 text-emerald-400" />
+                <h3 className="text-xl font-bold text-white">اختيار الكاميرا</h3>
+              </div>
+              <button onClick={() => setShowCamPicker(false)}
+                className="text-white/60 hover:text-white p-1 rounded-lg hover:bg-white/10 cursor-pointer">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <p className="text-white/50 text-sm leading-relaxed">
+              الكاميرا يفتحها الخادم (بايثون) وليس المتصفِّح، فلا يظهر طلب إذن من المتصفِّح
+              للفيديو. اختَر الجهاز من هنا وسيُعاد فتح الكاميرا فوراً.
+            </p>
+
+            {camScanning ? (
+              <div className="flex items-center justify-center gap-3 py-8 text-white/60">
+                <RefreshCw className="w-5 h-5 animate-spin" />
+                <span>جارٍ فحص الأجهزة المتَّصلة…</span>
+              </div>
+            ) : camList.length === 0 ? (
+              <div className="text-center py-8 flex flex-col gap-2">
+                <p className="text-white/70">لم يستجب أيُّ جهاز كاميرا</p>
+                <p className="text-white/40 text-sm leading-relaxed">
+                  تأكَّد أنَّ الكاميرا موصولة، وأغلِق أيَّ برنامج آخر يستخدمها
+                  (Zoom، Teams، Camera، OBS).
+                </p>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-2 max-h-[45vh] overflow-y-auto p-1">
+                {camList.map((c) => {
+                  const isActive = String(camActive) === String(c.source);
+                  return (
+                    <button
+                      key={c.source}
+                      onClick={() => {
+                        send({ type: 'set_camera', source: c.source });
+                        setCamActive(c.source);
+                        setShowCamPicker(false);
+                      }}
+                      className={`text-right px-4 py-3 rounded-xl border transition cursor-pointer flex items-center justify-between gap-3 ${isActive
+                        ? 'bg-emerald-600/25 border-emerald-500 text-emerald-100'
+                        : 'bg-white/5 border-white/10 text-white/85 hover:bg-white/10'
+                        }`}
+                    >
+                      <div className="min-w-0">
+                        <div className="font-bold truncate flex items-center gap-2">
+                          {c.label}
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-normal ${c.kind === 'integrated'
+                            ? 'bg-sky-500/20 text-sky-200'
+                            : c.kind === 'usb' ? 'bg-amber-500/20 text-amber-200'
+                              : 'bg-white/10 text-white/50'
+                            }`}>
+                            {c.kind === 'integrated' ? 'مدمجة'
+                              : c.kind === 'usb' ? 'USB'
+                                : c.kind === 'network' ? 'شبكة' : 'تلقائي'}
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-white/40 truncate">{c.detail}</div>
+                      </div>
+                      {isActive && <Check className="w-5 h-5 shrink-0 text-emerald-400" />}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            <div className="flex gap-2 pt-1">
+              <button
+                onClick={() => { setCamList([]); send({ type: 'list_cameras' }); }}
+                disabled={camScanning}
+                className="flex-1 py-2.5 rounded-xl bg-white/10 hover:bg-white/20 text-white/85 text-sm font-bold transition cursor-pointer flex items-center justify-center gap-2 disabled:opacity-40"
+              >
+                <RefreshCw className={`w-4 h-4 ${camScanning ? 'animate-spin' : ''}`} />
+                إعادة الفحص
+              </button>
+            </div>
+
+            {/* The microphone genuinely IS a browser permission. If it was
+                blocked once, no page can un-block itself — the browser only
+                accepts that from its own UI, so say where it is instead of
+                pretending a button can do it. */}
+            <div className="border-t border-white/10 pt-3 flex flex-col gap-2">
+              <div className="flex items-center justify-between">
+                <span className="text-white/70 text-sm">إذن الميكروفون (المتصفِّح)</span>
+                <span className={`text-xs px-2 py-0.5 rounded-full ${micPermission === 'granted' ? 'bg-emerald-600/30 text-emerald-200'
+                  : micPermission === 'denied' ? 'bg-red-600/30 text-red-200'
+                    : 'bg-white/10 text-white/60'
+                  }`}>
+                  {micPermission === 'granted' ? 'مسموح'
+                    : micPermission === 'denied' ? 'محظور'
+                      : micPermission === 'prompt' ? 'سيُسأل' : 'غير معروف'}
+                </span>
+              </div>
+              {micPermission === 'denied' ? (
+                <p className="text-white/40 text-xs leading-relaxed">
+                  لإعادة السماح: اضغط أيقونة القفل 🔒 بجانب العنوان في أعلى المتصفِّح ← الأذونات ←
+                  الميكروفون ← «سؤال» أو «سماح»، ثمَّ أعِد تحميل الصفحة. لا تستطيع الصفحة إلغاء الحظر بنفسها.
+                </p>
+              ) : (
+                <button
+                  onClick={() => navigator.mediaDevices.getUserMedia({ audio: true })
+                    .then((st) => { st.getTracks().forEach((t) => t.stop()); setMicPermission('granted'); })
+                    .catch(() => setMicPermission('denied'))}
+                  className="py-2 rounded-xl bg-white/10 hover:bg-white/20 text-white/85 text-sm transition cursor-pointer"
+                >
+                  طلب إذن الميكروفون
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showTrained && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4" dir="rtl">
+          <div className="bg-[#111827] border border-white/10 rounded-2xl w-full max-w-2xl p-5 flex flex-col gap-4 shadow-2xl">
+            <div className="flex justify-between items-center border-b border-white/10 pb-3">
+              <div className="flex items-center gap-2">
+                <Hand className="w-5 h-5 text-emerald-400" />
+                <h3 className="text-xl font-bold text-white">الإشارات المدرَّبة</h3>
+                <span className="text-sm text-white/50">({trained.length})</span>
+              </div>
+              <button onClick={() => setShowTrained(false)}
+                className="text-white/60 hover:text-white p-1 rounded-lg hover:bg-white/10 cursor-pointer">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {trained.length === 0 ? (
+              <div className="text-center py-10 flex flex-col gap-3">
+                <p className="text-white/70 text-lg">لا توجد إشارات مصدَّرة بعد</p>
+                <p className="text-white/40 text-sm leading-relaxed">
+                  سجّل إشارات بـ <code className="text-emerald-400">npm run collect</code>
+                  <br />
+                  ثم صدّرها للروبوت بـ <code className="text-emerald-400">npm run export3d</code>
+                </p>
+              </div>
+            ) : (
+              <>
+                <p className="text-white/50 text-sm">
+                  هذه الإشارات مشتقّة من تسجيلاتك أنت — الروبوت يؤدّيها كما أدّيتها،
+                  لا بزوايا مكتوبة يدوياً. اضغط أي إشارة ليؤدّيها.
+                </p>
+
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-[50vh] overflow-y-auto p-1">
+                  {trained.map((s) => (
+                    <button
+                      key={s.id}
+                      onClick={() => {
+                        signerRef.current?.playSigns([{ word: s.label, sign: s }]);
+                        setPlayingId(s.id);
+                        setTimeout(() => setPlayingId(null), (s.duration || 1.4) * 1000);
+                      }}
+                      className={`text-right px-3 py-2.5 rounded-xl border transition cursor-pointer ${playingId === s.id
+                        ? 'bg-emerald-600/30 border-emerald-500 text-emerald-100'
+                        : 'bg-white/5 border-white/10 text-white/85 hover:bg-white/10'
+                        }`}
+                    >
+                      <div className="font-bold truncate">{s.label}</div>
+                      <div className="text-[11px] text-white/40 flex justify-between mt-0.5">
+                        <span className="truncate">{s.id}</span>
+                        <span>{Number(s.duration).toFixed(1)}s</span>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => {
+                      // Play everything in order — a quick way to eyeball the
+                      // whole vocabulary for poses that came out wrong.
+                      signerRef.current?.playSigns(
+                        trained.map((s) => ({ word: s.label, sign: s }))
+                      );
+                    }}
+                    className="flex-1 bg-emerald-700 hover:bg-emerald-600 text-white py-2.5 rounded-xl font-bold transition cursor-pointer"
+                  >
+                    تشغيل الكل بالتتابع
+                  </button>
+                  <button
+                    onClick={() => { setShowTrained(false); setShowCalib(true); }}
+                    className="bg-amber-700 hover:bg-amber-600 text-white px-4 py-2.5 rounded-xl font-bold transition cursor-pointer"
+                    title="الأوضاع تبدو خاطئة؟"
+                  >
+                    معايرة
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {showCalib && (
+        <CalibrationPanel signerRef={signerRef} onClose={() => setShowCalib(false)} />
       )}
 
       {/* ══ Learn Modal ═══════════════════════════════════════════════════ */}

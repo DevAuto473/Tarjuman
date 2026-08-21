@@ -19,13 +19,13 @@ How it works
 ------------
 Wrist speed (per-frame displacement) drives a small state machine:
 
-    IDLE ──speed > START──▶ CAPTURING ──still for N frames──▶ emit ─▶ COOLDOWN
+    IDLE --speed > START--▶ CAPTURING --still for N frames--▶ emit -▶ COOLDOWN
       ▲                         │                                        │
-      └─────────────────────────┴──── hand disappears / too long ────────┘
+      `--------------------------┴---- hand disappears / too long --------┘
 
 Hysteresis (START > STOP) prevents rapid toggling around the threshold.
 
-Variable-length → fixed-length
+Variable-length -> fixed-length
 ------------------------------
 A captured gesture may be 14 frames or 60. `resample_sequence()` linearly
 interpolates it to exactly SEQUENCE_LENGTH frames, so:
@@ -51,9 +51,9 @@ from feature_extractor import (
 ASSUMED_FPS = 20.0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Tuning constants
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Speeds are in normalised image units per frame (a wrist crossing the whole
 # frame in 1 s at 30 fps ≈ 0.033/frame). Calibrate on the real Pi camera.
 
@@ -87,9 +87,9 @@ COOLDOWN_FRAMES     = 3      # brief pause after emitting, avoids double-fire
 PRE_ROLL_FRAMES = 4
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Sequence resampling
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def resample_sequence(frames: list, target_len: int = SEQUENCE_LENGTH) -> np.ndarray:
     """
@@ -121,9 +121,9 @@ def resample_sequence(frames: list, target_len: int = SEQUENCE_LENGTH) -> np.nda
     return resampled
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Wrist speed
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _wrist_points(frame_features) -> list[tuple[float, float]]:
     """
@@ -218,9 +218,9 @@ def _displacement(current, anchor) -> float:
     return _motion(current, anchor)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  The state machine
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 IDLE      = "idle"
 CAPTURING = "capturing"
@@ -251,7 +251,7 @@ class GestureSegmenter:
         self.cooldown_count = 0
         self.last_speed = 0.0
 
-    # ── Public API ──────────────────────────────────────────────────────────
+    # -- Public API ----------------------------------------------------------
 
     def reset(self) -> None:
         """Drop all in-flight state (call when hands leave or client stops)."""
@@ -284,7 +284,7 @@ class GestureSegmenter:
              "duration": float seconds,
              "frames":   int raw frames captured}
         """
-        # Hands gone → abandon whatever was in flight
+        # Hands gone -> abandon whatever was in flight
         if not hands_present:
             self.reset()
             return None
@@ -308,8 +308,8 @@ class GestureSegmenter:
             self.pre_roll_times.append(now)
 
             # Two independent triggers:
-            #   • fast movement  → per-frame speed
-            #   • slow movement  → total travel away from the resting anchor
+            #   • fast movement  -> per-frame speed
+            #   • slow movement  -> total travel away from the resting anchor
             anchor = self.anchor_history[0] if self.anchor_history else None
             drifted = _displacement(frame_features, anchor) > MOTION_START_DISPLACEMENT
 
@@ -324,7 +324,7 @@ class GestureSegmenter:
                 self.anchor_history.append(frame_features)
             return None
 
-        # ── CAPTURING ───────────────────────────────────────────────────────
+        # -- CAPTURING -------------------------------------------------------
         self.buffer.append(frame_features)
         self.buffer_times.append(now)
 
@@ -373,7 +373,7 @@ class GestureSegmenter:
             "frames":   len(captured),
         }
 
-    # ── Introspection (useful for the frontend / debugging) ─────────────────
+    # -- Introspection (useful for the frontend / debugging) -----------------
 
     @property
     def is_capturing(self) -> bool:

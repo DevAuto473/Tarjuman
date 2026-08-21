@@ -4,8 +4,8 @@ camera_manager.py — Smart Camera Abstraction Layer for Tarjuman
 Provides a unified SmartCamera interface that automatically detects
 the runtime environment and uses the most appropriate camera backend:
 
-  • Raspberry Pi (ARM/Linux)  →  Picamera2 (Camera Module 3, 12MP)
-  • Laptop / Dev Machine      →  OpenCV VideoCapture (cv2)
+  • Raspberry Pi (ARM/Linux)  ->  Picamera2 (Camera Module 3, 12MP)
+  • Laptop / Dev Machine      ->  OpenCV VideoCapture (cv2)
 
 The .read() method mirrors OpenCV's exact (ret, frame) tuple contract,
 making it a drop-in replacement anywhere cv2.VideoCapture is used.
@@ -24,9 +24,9 @@ except ImportError:
     pass
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Network camera (DroidCam / IP Webcam)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 DROIDCAM_IP   = os.getenv("DROIDCAM_IP",   "192.168.8.177")
 DROIDCAM_PORT = os.getenv("DROIDCAM_PORT", "4747")
@@ -45,9 +45,9 @@ def droidcam_url(host: str | None = None) -> str:
     return f"http://{host or DROIDCAM_IP}:{DROIDCAM_PORT}/video"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  USB tunnel (adb) — the reliable alternative to Wi-Fi
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #
 # Wi-Fi MJPEG stutters because the stream competes with everything else on the
 # network and has no flow control: when bandwidth dips, frames are simply lost.
@@ -206,9 +206,9 @@ def list_local_cameras(max_index: int = 6) -> list[tuple[int, int, int]]:
     return found
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Environment Detection
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _is_raspberry_pi() -> bool:
     """
@@ -239,9 +239,9 @@ def _is_raspberry_pi() -> bool:
         return True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  SmartCamera Class
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 class SmartCamera:
     """
@@ -271,13 +271,13 @@ class SmartCamera:
                     which is suitable for a signer seated in front of the Pi.
     """
 
-    # ── Shared configuration constants ──────────────────────────────────────
+    # -- Shared configuration constants --------------------------------------
     WIDTH         = 640
     HEIGHT        = 480
     FPS           = 30
     LENS_POSITION = 1.0   # Manual-focus position (≈ 1 m; adjust as needed)
 
-    # ── Backend identifiers ──────────────────────────────────────────────────
+    # -- Backend identifiers --------------------------------------------------
     BACKEND_PICAMERA2 = "picamera2"
     BACKEND_OPENCV    = "opencv"
     BACKEND_NETWORK   = "network"      # DroidCam / IP Webcam / any MJPEG stream
@@ -290,11 +290,11 @@ class SmartCamera:
         device_index : int
             Index passed to cv2.VideoCapture for a locally attached webcam.
         source : str | int | None
-            • None            → auto-detect (Picamera2 on a Pi, else webcam)
-            • "laptop"        → force the local webcam
-            • "droidcam"      → use the DroidCam URL from the environment
-            • int (e.g. 1, 2) → use USB camera with DSHOW backend at this index
-            • an http(s)/rtsp URL → use that stream directly
+            • None            -> auto-detect (Picamera2 on a Pi, else webcam)
+            • "laptop"        -> force the local webcam
+            • "droidcam"      -> use the DroidCam URL from the environment
+            • int (e.g. 1, 2) -> use USB camera with DSHOW backend at this index
+            • an http(s)/rtsp URL -> use that stream directly
 
         Why a network option
         --------------------
@@ -356,7 +356,7 @@ class SmartCamera:
             print(f"[SmartCamera] Environment detected : {env_label}")
             print(f"[SmartCamera] Requested backend    : {self._requested_backend}")
 
-    # ── Public API ──────────────────────────────────────────────────────────
+    # -- Public API ----------------------------------------------------------
 
     def start(self) -> "SmartCamera":
         """
@@ -428,7 +428,7 @@ class SmartCamera:
             self._last_frame = None
             self._backend    = None
 
-    # ── Picamera2 Backend ───────────────────────────────────────────────────
+    # -- Picamera2 Backend ---------------------------------------------------
 
     def _start_picamera2(self) -> None:
         """
@@ -446,18 +446,18 @@ class SmartCamera:
 
             picam = Picamera2()
 
-            # ── Build video configuration ─────────────────────────────────
-            # main stream → BGR888 so OpenCV receives frames with no colour conversion
+            # -- Build video configuration ---------------------------------
+            # main stream -> BGR888 so OpenCV receives frames with no colour conversion
             video_config = picam.create_video_configuration(
                 main={
                     "size":   (self.WIDTH, self.HEIGHT),
-                    "format": "BGR888",   # Native BGR → no cvtColor needed
+                    "format": "BGR888",   # Native BGR -> no cvtColor needed
                 },
                 controls={
                     # Lock framerate: both min and max to FPS (prevents dipping)
                     "FrameRate": self.FPS,
 
-                    # ── Manual focus — critical for gesture recognition ───
+                    # -- Manual focus — critical for gesture recognition ---
                     # AfMode 0 = Manual; prevents the lens from continuously
                     # hunting for focus, which causes blur during fast hand
                     # movements and can drop the effective FPS significantly.
@@ -499,7 +499,7 @@ class SmartCamera:
         """
         try:
             # capture_array("main") returns a numpy array in the configured
-            # pixel format: BGR888 → shape (H, W, 3), dtype uint8
+            # pixel format: BGR888 -> shape (H, W, 3), dtype uint8
             frame = self._cam.capture_array("main")
             if frame is None or frame.size == 0:
                 return False, None
@@ -509,7 +509,7 @@ class SmartCamera:
             print(f"[SmartCamera] Picamera2 read error: {exc}")
             return False, None
 
-    # ── Network Backend (DroidCam / IP Webcam) ──────────────────────────────
+    # -- Network Backend (DroidCam / IP Webcam) ------------------------------
 
     def _start_network(self) -> None:
         """
@@ -608,7 +608,7 @@ class SmartCamera:
             print(f"[SmartCamera] Network read error: {exc}")
             return False, None
 
-    # ── OpenCV Backend ──────────────────────────────────────────────────────
+    # -- OpenCV Backend ------------------------------------------------------
 
     def _start_opencv(self) -> None:
         """
@@ -758,7 +758,7 @@ class SmartCamera:
         self._cam = None
         self._backend = None
 
-    # ── Context manager support ──────────────────────────────────────────────
+    # -- Context manager support ----------------------------------------------
 
     def __enter__(self) -> "SmartCamera":
         """Enables:  with SmartCamera() as cam: ..."""
@@ -767,7 +767,7 @@ class SmartCamera:
     def __exit__(self, *_) -> None:
         self.release()
 
-    # ── Dunder helpers ──────────────────────────────────────────────────────
+    # -- Dunder helpers ------------------------------------------------------
 
     def __repr__(self) -> str:
         return (
@@ -776,7 +776,7 @@ class SmartCamera:
             f"fps={self.FPS})"
         )
 
-    # ── Read-only convenience properties ─────────────────────────────────────
+    # -- Read-only convenience properties -------------------------------------
 
     @property
     def backend(self):
@@ -794,9 +794,9 @@ class SmartCamera:
         return self._last_frame
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Quick smoke-test  (run:  python camera_manager.py)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     print("=" * 60)
@@ -832,3 +832,275 @@ if __name__ == "__main__":
     cam.release()
     cv2.destroyAllWindows()
     print("[SmartCamera] Preview closed.")
+
+
+# -----------------------------------------------------------------------------
+#  Device identification
+# -----------------------------------------------------------------------------
+
+# Words that appear in the NAME of a camera soldered into a laptop lid. Anything
+# without one of these had to be plugged in.
+_INTEGRATED_HINTS = ("integrated", "built-in", "builtin", "internal",
+                     "facetime", "user facing", "front camera", "laptop")
+
+
+def camera_device_names() -> tuple:
+    """
+    Real device names in enumeration order, on Windows.
+
+    Returns (names, exact). OpenCV identifies cameras by bare index, which tells
+    you nothing: index 1 could be a USB webcam, a phone acting as one, or a
+    virtual camera from OBS. Windows knows the product names, so it is asked
+    rather than guessed at.
+
+    Two sources, and the difference matters:
+
+      pygrabber  - enumerates DirectShow devices in exactly the order OpenCV
+                   assigns indices, so name and index line up by construction.
+                   `exact` is True.
+      PowerShell - lists PnP camera devices. Usually the same order, but that
+                   is a convention rather than a guarantee, so `exact` is False
+                   and the caller keeps showing the index and resolution for
+                   the user to check against.
+    """
+    if sys.platform != "win32":
+        return [], False
+
+    try:
+        from pygrabber.dshow_graph import FilterGraph
+        names = FilterGraph().get_input_devices()
+        if names:
+            return list(names), True
+    except Exception:
+        pass
+
+    query = ("Get-CimInstance Win32_PnPEntity | "
+             "Where-Object { $_.PNPClass -eq 'Camera' -or $_.PNPClass -eq 'Image' } | "
+             "Select-Object -ExpandProperty Name")
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", query],
+            capture_output=True, timeout=20,
+        )
+        names = [ln.strip() for ln in
+                 out.stdout.decode("utf-8", "replace").splitlines() if ln.strip()]
+        return names, False
+    except Exception:
+        return [], False
+
+
+def describe_cameras() -> list:
+    """
+    Every working camera, with a name and a kind.
+
+    Each entry: {"index", "width", "height", "name", "kind"} where kind is
+    "integrated" or "usb".
+
+    Entries also carry "exact": True when the name provably belongs to that
+    index (pygrabber enumerates in OpenCV's own order), False when it is a
+    best-effort match. Callers show the index and resolution either way - a
+    label you can sanity-check beats a confident label you cannot.
+    """
+    found = list_local_cameras()
+    names, exact = camera_device_names()
+
+    out = []
+    for pos, (idx, w, h) in enumerate(found):
+        name = names[pos] if pos < len(names) else None
+        if name:
+            kind = ("integrated"
+                    if any(h_ in name.lower() for h_ in _INTEGRATED_HINTS)
+                    else "usb")
+        else:
+            # No names available: index 0 is the built-in camera on a laptop.
+            kind = "integrated" if idx == 0 else "usb"
+        out.append({"index": idx, "width": w, "height": h,
+                    "name": name, "kind": kind, "exact": bool(name) and exact})
+    return out
+
+
+# -----------------------------------------------------------------------------
+#  Interactive chooser
+# -----------------------------------------------------------------------------
+# Shared by data_collector.py and websocket_server.py. Recording and inference
+# MUST use the same camera: the model learns the lens it was trained on, and a
+# different field of view shifts every landmark. One prompt, one behaviour.
+
+def choose_camera_interactive(*, allow_prompt: bool = True):
+    """
+    Ask which camera to record with.
+
+    A phone camera over DroidCam is usually much sharper than a laptop webcam,
+    and sharper frames give cleaner MediaPipe landmarks — the raw material the
+    whole model is built from. Worth the extra prompt.
+
+    Returns a source string (or int for USB index) understood by SmartCamera.
+
+    When there is nothing to read an answer from, it falls back to
+    CAMERA_SOURCE instead of raising: an unguarded input() at startup dies with
+    EOFError, and inside a task runner that reads as a crash with no cause.
+
+    Why this does NOT test isatty()
+    -------------------------------
+    Under `npm run dev:all` the process is a child of `concurrently`, so stdin
+    is a PIPE, not a terminal — even though `--handle-input` is forwarding your
+    keystrokes down it perfectly well. Testing isatty() therefore refused to ask
+    in exactly the case the question was most needed. What actually matters is
+    whether stdin can be READ, so that is what is tested, and EOF is caught.
+    """
+    preset = os.getenv("CAMERA_SOURCE")
+    if preset and preset.lower() != "auto":
+        print(f"\nCamera: {preset}  (from CAMERA_SOURCE)")
+        return preset
+
+    if os.getenv("TARJUMAN_NO_PROMPT"):
+        print("\nCamera: auto  (TARJUMAN_NO_PROMPT set)")
+        return "auto"
+
+    if not allow_prompt or not _stdin_readable():
+        print("\nCamera: auto  (no input available — set CAMERA_SOURCE in .env)")
+        return "auto"
+
+    print("\n" + "=" * 60)
+    print("  Select camera")
+    print("=" * 60)
+    print("  1. Integrated camera             (built into the laptop)")
+    print("  2. External USB webcam           (plugged in)")
+    print("  3. DroidCam / phone")
+    print("  4. Other stream URL")
+    print()
+
+    try:
+        return _camera_menu()
+    except (EOFError, KeyboardInterrupt):
+        # stdin closed under us, or the user pressed Ctrl-C at the prompt.
+        print("\nCamera: auto  (no answer given)")
+        return "auto"
+
+
+def _stdin_readable() -> bool:
+    """True when stdin is something we could actually read an answer from."""
+    stream = sys.stdin
+    if stream is None or getattr(stream, "closed", False):
+        return False
+    try:
+        stream.fileno()
+    except (OSError, ValueError, AttributeError):
+        return False
+    return True
+
+
+def _camera_menu():
+    """The question loop itself. Raises EOFError if stdin ends."""
+    while True:
+        choice = input("Choice [1-4, default 2]: ").strip() or "2"
+
+        if choice in ("1", "2"):
+            want = "integrated" if choice == "1" else "usb"
+            title = ("Integrated camera" if want == "integrated"
+                     else "External USB webcam")
+            print(f"\n  [{title}]")
+            print("  Scanning camera devices...")
+            cams = describe_cameras()
+
+            if not cams:
+                print("   [!] No camera devices responded.")
+                print("       - Is the webcam plugged in and its light on?")
+                print("       - Close Zoom / Teams / Windows Camera / OBS.")
+                print("       - Try a different USB port.")
+                continue
+
+            for c in cams:
+                mark = " <-" if c["kind"] == want else "   "
+                label = c["name"] or ("built-in (index 0)" if c["index"] == 0
+                                      else "external")
+                print(f"    {mark} index {c['index']}: {c['width']}x{c['height']}"
+                      f"  {label}  [{c['kind']}]")
+
+            matching = [c for c in cams if c["kind"] == want]
+
+            # One obvious answer: take it. Making someone type an index they
+            # cannot verify is how you end up recording on the wrong lens and
+            # only noticing after thirty samples.
+            if len(matching) == 1:
+                pick = matching[0]
+                print(f"\n   Using index {pick['index']}"
+                      f"{' - ' + pick['name'] if pick['name'] else ''}")
+                return f"index:{pick['index']}"
+
+            if not matching:
+                print(f"\n   [!] No {want} camera was detected.")
+                if want == "usb":
+                    print("       Check the cable and the USB port, then re-run.")
+                continue
+
+            print("\n   More than one matched. Not sure which is which?")
+            print("     npm run cameras -- --preview")
+            default = str(matching[0]["index"])
+            raw = input(f"\n   Camera index [default {default}]: ").strip() or default
+            if raw.isdigit():
+                return f"index:{raw}"
+            print("   [!] Enter one of the numbers listed above.")
+            continue
+
+        if choice == "3":
+            print("\n  [DroidCam Setup]")
+            print("  Wi-Fi MJPEG has no flow control: when bandwidth dips it")
+            print("  silently DROPS frames, and lost frames distort the exact")
+            print("  timing the model learns from. Prefer USB for recording.")
+            print()
+            print("  1. USB - virtual webcam    <- iPhone AND Android")
+            print("  2. USB - adb tunnel        <- ANDROID ONLY (no PC client)")
+            print("  3. Wi-Fi                   (requires IP, may stutter)")
+            print()
+            print("  iPhone: adb cannot talk to iOS at all — use option 1.")
+            dc_mode = input("  Choose mode [1-3, default 1]: ").strip() or "1"
+
+            if dc_mode == "3":
+                print("\n  Before continuing:")
+                print("   - DroidCam app is OPEN on the phone")
+                print("   - Phone and PC are on the same Wi-Fi")
+                print(f"   - The app shows {DROIDCAM_IP}:{DROIDCAM_PORT}")
+                print("   (change via DROIDCAM_IP / DROIDCAM_PORT in .env)")
+                return "droidcam"
+
+            if dc_mode == "2":
+                print("\n  [adb tunnel - ANDROID ONLY]")
+                print("   This will NOT work with an iPhone.")
+                print("   1. Platform Tools folder set in .env as ADB_PATH")
+                print("   2. Developer Options ON (tap Build number 7 times)")
+                print("   3. USB debugging ON")
+                print("   4. DroidCam app OPEN on the phone")
+                print("   5. Cable connected, 'Allow USB debugging' accepted")
+                return "droidcam-usb"
+
+            # Default: virtual webcam — works for iPhone and Android alike
+            print("\n  [USB - virtual webcam]")
+            print("   1. DroidCam (or iVCam / Camo) PC client is OPEN")
+            print("   2. Mode set to USB, 'Connect' pressed")
+            print("   3. Phone connected by cable, app open on the phone")
+            print("   iPhone also needs Apple's iTunes / Apple Devices installed")
+            print("   (it provides the USB drivers Windows needs).")
+            print("\n  Scanning local camera devices...")
+            cams = list_local_cameras()
+            if cams:
+                for idx, w, h in cams:
+                    hint = "   <- likely the phone (higher resolution)" if w >= 1280 else ""
+                    print(f"     index {idx}:  {w}x{h}{hint}")
+            else:
+                print("     [!] No devices responded. Is the PC client connected?")
+            cam_idx = input("\n   Camera index [default 1]: ").strip() or "1"
+            try:
+                return int(cam_idx)
+            except ValueError:
+                return "usb_dshow"
+
+        if choice == "4":
+            url = input("  Stream URL: ").strip()
+            if "://" in url:
+                return url
+            print("  [!] Must be a full URL, e.g. http://192.168.8.177:4747/video")
+            continue
+
+        print("  [!] Enter 1, 2, 3 or 4.")

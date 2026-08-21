@@ -24,7 +24,7 @@ Per frame:
 Per hand (68 values):
       [0:3]    wrist in BODY coordinates (see below)
       [3:63]   landmarks 1..20 relative to the wrist, divided by palm length
-               → hand SHAPE, invariant to position and distance
+               -> hand SHAPE, invariant to position and distance
       [63:68]  distance from the wrist to five body anchors:
                nose, mouth, ear, shoulder, chest-centre
 A hand that is not detected contributes 68 zeros.
@@ -66,7 +66,7 @@ Why the division matters (NORMALIZE_SCALE)
 Subtracting the wrist only removes TRANSLATION. If the signer leans closer to
 the camera, every relative offset grows proportionally and an identical hand
 shape looks like a different one to the model. Dividing by palm length —
-the wrist → middle-finger-MCP distance, which barely moves as fingers open and
+the wrist -> middle-finger-MCP distance, which barely moves as fingers open and
 close — removes SCALE too, so the same sign reads the same at 0.5 m and 1.5 m.
 No information is lost: absolute distance is still available from the raw wrist
 coordinates and from estimate_distance().
@@ -81,18 +81,32 @@ inference and the model silently learns the wrong hand. `MIRROR_FRAME` below
 is the single switch that guarantees this; use `prepare_frame()` everywhere.
 """
 
-import cv2
 import numpy as np
 
+# OpenCV is deliberately NOT imported at module level. This module is imported
+# by train_model.py and export_signs_3d.py purely for its CONSTANTS, and pulling
+# OpenCV's native libraries into those processes buys nothing while adding one
+# more DLL that can clash with scikit-learn's or ONNX's. It is loaded on first
+# use instead, which is inside the camera path where it is genuinely needed.
+_cv2 = None
 
-# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_cv2():
+    global _cv2
+    if _cv2 is None:
+        import cv2 as _c
+        _cv2 = _c
+    return _cv2
+
+
+# -----------------------------------------------------------------------------
 #  Geometry constants
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 N_HAND_LANDMARKS = 21
 COORDS_PER_LM    = 3                       # x, y, z  (hands carry no visibility)
 
-# ── Body anchors (MediaPipe Pose landmark indices) ───────────────────────────
+# -- Body anchors (MediaPipe Pose landmark indices) ---------------------------
 # Only these are used. Pose reports 33 points; the rest (elbows, hips, legs)
 # add nothing for a seated signer and would only dilute the feature vector.
 POSE_NOSE        = 0
@@ -118,7 +132,7 @@ VALS_PER_FRAME   = VALS_PER_HAND * 2 + BODY_BLOCK_VALS  # 140
 SEQUENCE_LENGTH  = 30
 FRAME_FEATURES   = VALS_PER_FRAME * SEQUENCE_LENGTH     # 3 780
 
-# ── Global (whole-gesture) features ──────────────────────────────────────────
+# -- Global (whole-gesture) features ------------------------------------------
 # Appended once per sample, AFTER the per-frame block.
 #
 # Why they exist
@@ -139,7 +153,7 @@ GLOBAL_FEATURE_NAMES = (
     "peak_speed",        # fastest instant — urgency shows up here
     "speed_variance",    # smooth glide vs. sharp jab
     "path_length",       # total distance travelled
-    "net_dx",            # signed horizontal displacement (start → end)
+    "net_dx",            # signed horizontal displacement (start -> end)
     "net_dy",            # signed vertical displacement — up vs. down signs
     "range_x",           # horizontal extent covered
     "range_y",           # vertical extent covered
@@ -155,9 +169,9 @@ WRIST_IDX        = 0
 MIDDLE_MCP_IDX   = 9                       # used as a stable hand-size proxy
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Frame orientation
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #
 # Mirror the frame so the signer sees themselves as in a mirror. This MUST be
 # identical in data_collector.py and websocket_server.py — see module docstring.
@@ -166,12 +180,12 @@ MIRROR_FRAME = True
 
 def prepare_frame(frame_bgr: np.ndarray) -> np.ndarray:
     """Apply the canonical orientation. Call before ANY MediaPipe processing."""
-    return cv2.flip(frame_bgr, 1) if MIRROR_FRAME else frame_bgr
+    return _get_cv2().flip(frame_bgr, 1) if MIRROR_FRAME else frame_bgr
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Scale normalisation
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #
 # Divide the relative (shape) block by palm length so hand shape is invariant
 # to how far the signer sits from the camera. See module docstring.
@@ -183,9 +197,9 @@ NORMALIZE_SCALE = True
 _MIN_PALM_LENGTH = 1e-6
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Hand splitting (mp.solutions.hands has no left/right attributes)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def split_hands(results):
     """
@@ -216,13 +230,13 @@ def split_hands(results):
     return left, right
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Hybrid feature extraction:  raw wrist (location) + relative shape
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Body anchors — the reference frame that makes location meaningful
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 # Pose is markedly slower than Hands, and a seated signer's torso barely moves
 # between frames. Running it every Nth frame and reusing the last anchors keeps
@@ -312,7 +326,7 @@ class BodyAnchors:
         self.face_size = 0.0
         self.tilt = 0.0
 
-    # ── Construction ────────────────────────────────────────────────────────
+    # -- Construction --------------------------------------------------------
 
     @classmethod
     def from_pose(cls, pose_results) -> "BodyAnchors":
@@ -373,7 +387,7 @@ class BodyAnchors:
 
         return a
 
-    # ── Use ─────────────────────────────────────────────────────────────────
+    # -- Use -----------------------------------------------------------------
 
     def to_body_coords(self, x: float, y: float) -> tuple[float, float]:
         """Map a normalised frame point into body coordinates."""
@@ -402,7 +416,7 @@ class BodyAnchors:
     def body_block(self) -> list[float]:
         """The 4 per-frame body values appended after both hands."""
         return [
-            float(self.scale),      # shoulder width in frame units → distance cue
+            float(self.scale),      # shoulder width in frame units -> distance cue
             float(self.face_size),  # head size relative to shoulders
             float(self.tilt),       # torso lean
             1.0 if self.valid else 0.0,
@@ -411,7 +425,7 @@ class BodyAnchors:
 
 def hand_features_from_array(coords: np.ndarray) -> list[float]:
     """
-    THE canonical hand → 63-feature transform. Everything else delegates here.
+    THE canonical hand -> 63-feature transform. Everything else delegates here.
 
     Both the live pipeline (MediaPipe landmark objects) and the offline dataset
     migration (raw CSV numbers) funnel into this one function, so the two can
@@ -506,13 +520,13 @@ def extract_frame_features(results, anchors: "BodyAnchors" = None) -> list[float
             + body.body_block())
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 #  Distance feedback — replaces the old Pose shoulder-ratio heuristic
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _hand_openness(hand_block: list) -> float:
     """
-    How extended the fingers are, 0 (closed) → ~1 (fully open).
+    How extended the fingers are, 0 (closed) -> ~1 (fully open).
 
     Uses the mean distance of the wrist-relative landmarks. Because that block
     is already palm-length normalised, this is comparable across users and
@@ -544,7 +558,7 @@ def compute_global_features(frames, duration_seconds: float) -> list[float]:
     n_frames = arr.shape[0]
     duration = max(float(duration_seconds), 1e-3)
 
-    # ── Wrist trajectory (whichever hand is present, averaged) ──────────────
+    # -- Wrist trajectory (whichever hand is present, averaged) --------------
     positions = []
     hands_present = []
     for row in arr:
@@ -569,7 +583,7 @@ def compute_global_features(frames, duration_seconds: float) -> list[float]:
     net = track[-1] - track[0]
     span = track.max(axis=0) - track.min(axis=0)
 
-    # ── Hand openness over time ─────────────────────────────────────────────
+    # -- Hand openness over time ---------------------------------------------
     openness = []
     for row in arr:
         vals = [
@@ -607,7 +621,7 @@ def estimate_distance(results) -> dict | None:
     Estimate how far the signer is, using hand size instead of shoulder width
     (Pose is no longer computed).
 
-    Uses palm length — the wrist → middle-finger-MCP distance — because unlike
+    Uses palm length — the wrist -> middle-finger-MCP distance — because unlike
     a bounding box it barely changes when fingers open or close, making it a
     much steadier distance proxy.
 
