@@ -1,0 +1,16 @@
+# Makes `pip install -e .` work, so tarjuman_core imports resolve without any
+# path juggling. Optional: the npm scripts set PYTHONPATH themselves, and the
+# entry points carry a bootstrap for direct `python x.py` runs. This is the
+# clean route for anyone who prefers a real install.
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tarjuman-core"
+version = "0.1.0"
+description = "Shared library for the Tarjuman Arabic Sign Language translator"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["src"]

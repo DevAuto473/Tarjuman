@@ -14,6 +14,7 @@ making it a drop-in replacement anywhere cv2.VideoCapture is used.
 import os
 import platform
 import sys
+import time
 import cv2
 import numpy as np
 
@@ -272,10 +273,42 @@ class SmartCamera:
     """
 
     # -- Shared configuration constants --------------------------------------
-    WIDTH         = 640
-    HEIGHT        = 480
-    FPS           = 30
+    # Overridable from .env, because the mode that delivers the most frames is
+    # a property of YOUR camera and can only be found by measuring it
+    # (`npm run bench` sweeps them). MediaPipe resizes to a fixed tensor
+    # internally, so a lower resolution costs it nothing - which makes trading
+    # pixels for frames a genuinely free win when the sensor allows it.
+    WIDTH         = int(os.getenv("CAMERA_WIDTH", "640"))
+    HEIGHT        = int(os.getenv("CAMERA_HEIGHT", "480"))
+    # Ask the sensor for more than we expect to consume. Delivery rate and
+    # processing rate are different things: MediaPipe costs ~20 ms per frame
+    # whatever the resolution, so the camera should never be the limit. A
+    # sensor running at 60 also halves the age of the newest frame, which is
+    # what stops the hand tracker losing the hand between detections.
+    FPS           = int(os.getenv("CAMERA_FPS", "60"))
     LENS_POSITION = 1.0   # Manual-focus position (≈ 1 m; adjust as needed)
+
+    # -- Low-light manual exposure / gain --------------------------------------
+    # `_force_frame_rate()` below already SEARCHES for a fast-enough exposure
+    # automatically. These two let you PIN the result instead of searching —
+    # useful once a physical LED light is added and you know exactly what
+    # works, or if you want the same settings every run without re-measuring.
+    #
+    #   CAMERA_EXPOSURE : log2(seconds) on Windows/DirectShow (-6 = 1/64 s;
+    #                     more negative = shorter = faster but darker) and
+    #                     backend-specific raw units on V4L2/Linux. Leave
+    #                     unset (None) to keep the automatic search below.
+    #   CAMERA_GAIN     : sensor gain/ISO to brighten the image without
+    #                     lengthening exposure. Raise this first when a
+    #                     fixed exposure looks too dark — it costs noise,
+    #                     not frame rate. 0-255 on most UVC webcams.
+    #
+    # Both are read once at import time so `npm run bench` / `.env` changes
+    # take effect on the next run without touching this file.
+    _manual_exposure_raw = os.getenv("CAMERA_EXPOSURE")
+    _manual_gain_raw     = os.getenv("CAMERA_GAIN")
+    MANUAL_EXPOSURE = float(_manual_exposure_raw) if _manual_exposure_raw else None
+    MANUAL_GAIN     = float(_manual_gain_raw) if _manual_gain_raw else None
 
     # -- Backend identifiers --------------------------------------------------
     BACKEND_PICAMERA2 = "picamera2"
@@ -308,6 +341,10 @@ class SmartCamera:
         self._cam          = None   # Backend camera object
         self._last_frame   = None   # Cached latest frame (numpy ndarray)
         self._url          = None   # Stream URL when in network mode
+        # True when the CSI camera was ASKED FOR by name rather than merely
+        # auto-detected. It decides whether a failure may fall back to a USB
+        # webcam: auto-detection may, an explicit choice may not.
+        self._explicit_picamera = False
 
         # If source is an integer, it means the user selected DroidCam USB
         if isinstance(source, int):
@@ -338,6 +375,12 @@ class SmartCamera:
             elif "://" in source:
                 self._url = source
                 self._requested_backend = self.BACKEND_NETWORK
+            elif source.lower() in ("picamera", "picamera2", "pi", "picam",
+                                    "csi", "pi-camera", "rpi"):
+                # The CSI-attached Camera Module, requested by name. This is
+                # how the Pi records its dataset; see _start_picamera2.
+                self._requested_backend = self.BACKEND_PICAMERA2
+                self._explicit_picamera = True
             elif source.lower() == "laptop":
                 self._requested_backend = self.BACKEND_OPENCV
             elif source.lower() == "usb_dshow":
@@ -381,6 +424,356 @@ class SmartCamera:
 
         return self
 
+
+    # -- Stream format negotiation --------------------------------------------
+
+    def _fourcc_tag(self, cap) -> str:
+        f = int(cap.get(cv2.CAP_PROP_FOURCC))
+        if not f:
+            return "?"
+        return "".join(chr((f >> (8 * i)) & 0xFF) for i in range(4)).strip()
+
+    def _measure_rate(self, cap, seconds: float = 0.7, settle: int = 8) -> float:
+        """
+        Frames actually delivered per second, with nothing else in the loop.
+
+        The settle frames are not optional. A camera re-negotiating its media
+        type delivers erratically for the first handful of frames, and timing
+        those gave 20 fps for a sensor genuinely running at 30 - a wrong number
+        that could make this function pick the worse of two formats.
+        """
+        for _ in range(settle):
+            cap.read()
+        t0 = time.perf_counter()
+        n = 0
+        while time.perf_counter() - t0 < seconds:
+            ok, _ = cap.read()
+            if ok:
+                n += 1
+        return n / (time.perf_counter() - t0)
+
+    def _negotiate_format(self, cap) -> dict:
+        """
+        Get MJPEG at the requested rate to actually STICK, and prove it did.
+
+        Setting properties on a capture device is a negotiation, not a command,
+        and the order matters in a way that is easy to get wrong: on DirectShow,
+        setting the RESOLUTION renegotiates the media type and quietly reverts
+        the pixel format to the driver's default. Requesting MJPG first and the
+        size second therefore ends up back in YUY2 - which is exactly what
+        happened here, while the log cheerfully reported "CAP_DSHOW + MJPG".
+
+        So several orders are tried and each is VERIFIED by reading the format
+        back and timing real frames. Whichever genuinely delivers the most
+        frames per second wins. Believing the request instead of checking the
+        result is what hid a 20 fps ceiling behind a 60 fps log line.
+        """
+        MJPG = cv2.VideoWriter_fourcc(*"MJPG")
+
+        def apply(steps):
+            for step in steps:
+                if step == "size":
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.WIDTH)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.HEIGHT)
+                elif step == "mjpg":
+                    cap.set(cv2.CAP_PROP_FOURCC, MJPG)
+                elif step == "fps":
+                    cap.set(cv2.CAP_PROP_FPS, self.FPS)
+
+        plans = [
+            ("size -> MJPG -> fps",        ["size", "mjpg", "fps"]),
+            ("MJPG -> size -> MJPG -> fps", ["mjpg", "size", "mjpg", "fps"]),
+            ("MJPG -> size -> fps",        ["mjpg", "size", "fps"]),
+            ("size -> fps (no MJPG)",      ["size", "fps"]),
+        ]
+
+        best = None
+        for label, steps in plans:
+            apply(steps)
+            tag = self._fourcc_tag(cap)
+            rate = self._measure_rate(cap)
+            cand = {"plan": label, "steps": steps, "fourcc": tag, "rate": rate}
+            if best is None or rate > best["rate"] + 1.0:
+                best = cand
+            # Good enough to stop early: MJPEG and close to what we asked for.
+            if tag.upper().startswith("MJP") and rate >= self.FPS * 0.75:
+                break
+
+        if best["steps"] != plans[-1][1]:
+            apply(best["steps"])
+            for _ in range(3):
+                cap.read()
+
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
+        best["width"] = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        best["height"] = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        best["fourcc"] = self._fourcc_tag(cap)
+        print(f"[SmartCamera] format negotiated: {best['fourcc']} "
+              f"{best['width']}x{best['height']} ~{best['rate']:.0f} fps "
+              f"(via {best['plan']})")
+        if not best["fourcc"].upper().startswith("MJP"):
+            print("[SmartCamera] [!] driver refused MJPEG; raw formats are "
+                  "bandwidth-capped, so the rate will stay low.")
+
+        # Format is settled; now make sure auto-exposure is not halving the rate.
+        self._force_frame_rate(cap, min(self.FPS, 30))
+        return best
+
+
+    def _frame_brightness(self, cap) -> float:
+        """Mean luma of a fresh frame, 0-255. Used to refuse a too-dark trade."""
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            return 0.0
+        return float(np.mean(frame))
+
+    def _disable_auto_exposure(self, cap) -> bool:
+        """
+        Turn off auto-exposure, regardless of which backend is behind `cap`.
+
+        DirectShow (Windows) and V4L2 (Linux/Raspberry Pi) do not agree on
+        what "manual" even means numerically: DirectShow wants 0.25, V4L2
+        wants 1 (3 is its "aperture priority" auto mode), and some UVC
+        drivers only accept 0. Setting an unsupported value is usually
+        just ignored rather than raising, so every candidate is tried
+        behind its own try/except - one backend's quirk must not be able
+        to abort the others or crash the caller.
+        """
+        applied_any = False
+        for value in (0.25, 1, 0):
+            try:
+                if cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, value):
+                    applied_any = True
+            except Exception:
+                pass
+        return applied_any
+
+    def _apply_fixed_exposure_gain(self, cap, exposure=None, gain=None) -> dict:
+        """
+        Pin exposure and gain to fixed values instead of searching for them.
+
+        Each property is set behind its own try/except: `CAP_PROP_EXPOSURE`,
+        `CAP_PROP_GAIN` and `CAP_PROP_ISO_SPEED` are all backend-dependent and
+        a webcam driver that rejects one should not take down the others.
+        Gain is tried before ISO_SPEED because most UVC webcams on Windows
+        expose GAIN; ISO_SPEED is the fallback some Linux/V4L2 drivers use
+        instead. Returns whatever actually got applied, so the caller can log
+        the truth instead of the intent.
+        """
+        applied: dict = {}
+        self._disable_auto_exposure(cap)
+
+        if exposure is not None:
+            try:
+                cap.set(cv2.CAP_PROP_EXPOSURE, float(exposure))
+                applied["exposure"] = float(exposure)
+            except Exception as exc:
+                print(f"[SmartCamera] [!] could not set CAP_PROP_EXPOSURE: {exc}")
+
+        if gain is not None:
+            gain_set = False
+            try:
+                if cap.set(cv2.CAP_PROP_GAIN, float(gain)):
+                    applied["gain"] = float(gain)
+                    gain_set = True
+            except Exception:
+                pass
+            if not gain_set:
+                try:
+                    if cap.set(cv2.CAP_PROP_ISO_SPEED, float(gain)):
+                        applied["iso_speed"] = float(gain)
+                except Exception as exc:
+                    print(f"[SmartCamera] [!] could not set gain/ISO "
+                          f"(GAIN and ISO_SPEED both unsupported): {exc}")
+
+        return applied
+
+    def _force_frame_rate(self, cap, target_rate: float) -> dict:
+        """
+        Stop the camera halving its own frame rate in dim light.
+
+        UVC webcams run auto-exposure by default. In a dim room the driver
+        lengthens the exposure time to brighten the picture, and since a frame
+        cannot be produced faster than it is exposed, the sensor silently drops
+        from 30 fps to 15 - or lower. Nothing in software reports this; the
+        frames simply arrive half as often.
+
+        That is a bad trade for sign language. A longer exposure also MOTION
+        BLURS a moving hand, so the frames you do get are worse for landmark
+        detection, not better. Fewer, blurrier frames is the opposite of what
+        the tracker needs.
+
+        So auto-exposure is switched off and progressively shorter exposures are
+        tried, each one MEASURED for both frame rate and brightness. The
+        shortest exposure that hits the target rate while keeping the image
+        usable wins; if none does, the original settings are restored rather
+        than leaving you with a fast, black picture.
+        """
+        before_rate = self._measure_rate(cap, seconds=0.5)
+        before_bright = self._frame_brightness(cap)
+
+        # Manual override: skip the search entirely and pin the values you
+        # already know work (e.g. once a physical LED light is in place).
+        # Set via CAMERA_EXPOSURE / CAMERA_GAIN in .env.
+        if self.MANUAL_EXPOSURE is not None:
+            try:
+                applied = self._apply_fixed_exposure_gain(
+                    cap, exposure=self.MANUAL_EXPOSURE, gain=self.MANUAL_GAIN)
+                rate = self._measure_rate(cap, seconds=0.45)
+                bright = self._frame_brightness(cap)
+                print(f"[SmartCamera] manual exposure/gain applied {applied} "
+                      f"-> {rate:.0f} fps, brightness {bright:.0f}/255 "
+                      f"[was {before_rate:.0f} fps]")
+                return {"changed": True, "rate": rate, "brightness": bright,
+                        **applied}
+            except Exception as exc:
+                print(f"[SmartCamera] [!] manual exposure/gain failed ({exc}); "
+                      f"falling back to automatic search.")
+
+        if before_rate >= target_rate * 0.85:
+            return {"changed": False, "rate": before_rate,
+                    "brightness": before_bright}
+
+        prev_auto = cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+        prev_exp = cap.get(cv2.CAP_PROP_EXPOSURE)
+        try:
+            prev_gain = cap.get(cv2.CAP_PROP_GAIN)
+        except Exception:
+            prev_gain = None
+
+        # 0.25 is DirectShow's "manual"; 1/0 are what other backends expect.
+        for manual in (0.25, 1, 0):
+            try:
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, manual)
+            except Exception:
+                pass
+            # Exposure is log2 seconds on Windows: -5 is 1/32 s, -6 is 1/64 s.
+            # Anything at or below -6 comfortably clears 30 fps.
+            for exposure in (-5, -6, -7):
+                try:
+                    cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
+                except Exception:
+                    pass
+                # A configured gain compensates for the shorter exposure
+                # without costing any frame rate, unlike lengthening exposure.
+                if self.MANUAL_GAIN is not None:
+                    try:
+                        cap.set(cv2.CAP_PROP_GAIN, self.MANUAL_GAIN)
+                    except Exception:
+                        pass
+                rate = self._measure_rate(cap, seconds=0.45)
+                bright = self._frame_brightness(cap)
+                if rate >= target_rate * 0.85 and bright >= 45:
+                    print(f"[SmartCamera] exposure fixed at {exposure} "
+                          f"(auto off) -> {rate:.0f} fps, brightness "
+                          f"{bright:.0f}/255  [was {before_rate:.0f} fps]")
+                    return {"changed": True, "rate": rate,
+                            "brightness": bright, "exposure": exposure}
+
+        # Nothing worked: put it back exactly as it was.
+        try:
+            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, prev_auto)
+            cap.set(cv2.CAP_PROP_EXPOSURE, prev_exp)
+            if prev_gain is not None:
+                cap.set(cv2.CAP_PROP_GAIN, prev_gain)
+        except Exception:
+            pass
+        rate = self._measure_rate(cap, seconds=0.3)
+        print(f"[SmartCamera] [!] Sensor is running at {before_rate:.0f} fps, "
+              f"not {target_rate:.0f}.")
+        print("[SmartCamera]     Shorter exposures were too dark to use, so the")
+        print("[SmartCamera]     camera was left as it was. MORE LIGHT on the")
+        print("[SmartCamera]     signer is the real fix - it raises the frame")
+        print("[SmartCamera]     rate AND removes motion blur from moving hands.")
+        print("[SmartCamera]     Once a light is in place, you can also pin exact")
+        print("[SmartCamera]     values via CAMERA_EXPOSURE / CAMERA_GAIN in .env")
+        print("[SmartCamera]     instead of relying on this search.")
+        return {"changed": False, "rate": rate, "brightness": before_bright}
+
+    # -- Background grabber ---------------------------------------------------
+    # cv2's read() BLOCKS until the next frame arrives. In a serial loop you
+    # therefore pay the wait AND the inference back to back, so the two never
+    # overlap - measured as the single largest avoidable cost in the pipeline.
+    #
+    # A grabber thread keeps only the NEWEST frame and throws away anything
+    # older. Dropping stale frames is the point: a sign is judged on where the
+    # hand is now, and showing the recogniser a frame from 80 ms ago is worse
+    # than showing it nothing.
+
+    def start_grabber(self) -> "SmartCamera":
+        """Begin decoding frames in the background. Safe to call twice."""
+        import threading
+        if getattr(self, "_grab_thread", None) is not None:
+            return self
+        self._grab_lock = threading.Lock()
+        self._grab_frame = None
+        self._grab_seq = 0
+        self._served_seq = None
+        self._grab_stop = threading.Event()
+
+        def loop():
+            while not self._grab_stop.is_set():
+                ok, frame = self._read_direct()
+                if ok and frame is not None:
+                    with self._grab_lock:
+                        self._grab_frame = frame
+                        self._grab_seq += 1
+                else:
+                    time.sleep(0.005)
+
+        self._grab_thread = threading.Thread(target=loop, daemon=True,
+                                             name="tarjuman-camera")
+        self._grab_thread.start()
+        return self
+
+    def stop_grabber(self) -> None:
+        if getattr(self, "_grab_thread", None) is None:
+            return
+        self._grab_stop.set()
+        self._grab_thread.join(timeout=1.0)
+        self._grab_thread = None
+
+    def read_latest(self, since: int = None, wait: float = 0.5):
+        """
+        Newest decoded frame, skipping any that piled up while you were busy.
+
+        Returns (ok, frame, seq). `seq` counts decoded frames, so a caller can
+        tell a genuinely new frame from a repeat.
+
+        `since` is what makes this correct rather than merely fast. Without it
+        the grabber happily returns the SAME frame again whenever inference
+        outruns the sensor, and a duplicate frame is not harmless here: it has
+        zero displacement from its predecessor, so it drags the measured speed
+        down, pollutes the motion features the model is trained on, and inflates
+        the frame-rate estimate with frames that were never captured. Waiting
+        for the counter to move keeps every frame handed out a real one.
+        """
+        if getattr(self, "_grab_thread", None) is None:
+            ok, frame = self._read_direct()
+            return ok, frame, -1
+        deadline = time.time() + wait
+        while True:
+            with self._grab_lock:
+                if self._grab_frame is not None and self._grab_seq != since:
+                    return True, self._grab_frame, self._grab_seq
+            if time.time() > deadline:
+                return False, None, -1
+            time.sleep(0.001)
+
+    def _read_direct(self):
+        """The original blocking read, used by the grabber thread."""
+        if self._cam is None:
+            return False, None
+        if self._backend == self.BACKEND_PICAMERA2:
+            return self._read_picamera2()
+        elif self._backend == self.BACKEND_NETWORK:
+            return self._read_network()
+        return self._read_opencv()
+
     def read(self):
         """
         Capture and return the next frame.
@@ -392,16 +785,18 @@ class SmartCamera:
             frame is a BGR numpy array of shape (HEIGHT, WIDTH, 3).
             Returns (False, None) if the camera is not started or on error.
         """
-        if self._cam is None:
-            return False, None
-
-        if self._backend == self.BACKEND_PICAMERA2:
-            return self._read_picamera2()
-        elif self._backend == self.BACKEND_NETWORK:
-            return self._read_network()
-        else:
-            # OpenCV handles both BACKEND_OPENCV and BACKEND_USB_DSHOW
-            return self._read_opencv()
+        # When a grabber is running, serve the newest frame from it so callers
+        # that never migrated to read_latest() still stop blocking.
+        if getattr(self, "_grab_thread", None) is not None:
+            # Remember what we last handed out so callers that never migrated to
+            # read_latest() still get a NEW frame on every call, exactly as a
+            # blocking read() always did.
+            last = getattr(self, "_served_seq", None)
+            ok, frame, seq = self.read_latest(since=last)
+            if ok:
+                self._served_seq = seq
+            return ok, frame
+        return self._read_direct()
 
     def release(self) -> None:
         """
@@ -432,74 +827,132 @@ class SmartCamera:
 
     def _start_picamera2(self) -> None:
         """
-        Configure and start Picamera2 with:
-          • Fixed 640x480 video stream at 30 FPS
-          • Manual (fixed) lens position to prevent autofocus hunting,
-            which causes motion blur and FPS drops during fast
-            sign-language gestures.
+        Start the CSI-attached Raspberry Pi camera (Module 3 and friends).
 
-        Falls back to OpenCV automatically on any import or runtime error.
+        Three things here are easy to get wrong and expensive to discover late:
+
+        PIXEL FORMAT. Picamera2 inherits its format names from libcamera, and
+        they describe memory layout rather than the numpy channel order you
+        end up with - so they read BACKWARDS. "RGB888" is the one that hands
+        OpenCV a (B, G, R) array; "BGR888" gives you (R, G, B). This file
+        previously asked for BGR888 with a comment saying "native BGR, no
+        cvtColor needed", which was exactly inverted: every frame would have
+        had red and blue swapped. That does not throw, it just quietly makes
+        skin tones blue - degrading MediaPipe's hand detection AND making Pi
+        recordings inconsistent with the laptop's, which is far worse for a
+        shared dataset than an outright crash.
+
+        LATENCY. queue=False stops the camera handing back a frame it had
+        already prepared before the request. That queued frame is by
+        definition stale, and a sign is judged on where the hand is NOW.
+
+        AUTOFOCUS. AfMode/LensPosition exist only on autofocus modules
+        (Camera Module 3). On Module 2, the HQ camera or the Global Shutter
+        camera they raise, so they are applied separately after start and
+        allowed to fail - a fixed-focus camera simply does not need them.
         """
         try:
-            # Import is deferred so this file can be imported on non-Pi systems
+            # Deferred import: this module is imported on the Windows laptop
+            # too, where picamera2 does not exist and must not be required.
             from picamera2 import Picamera2  # type: ignore[import]
 
             picam = Picamera2()
 
-            # -- Build video configuration ---------------------------------
-            # main stream -> BGR888 so OpenCV receives frames with no colour conversion
-            video_config = picam.create_video_configuration(
+            config_kwargs = dict(
                 main={
-                    "size":   (self.WIDTH, self.HEIGHT),
-                    "format": "BGR888",   # Native BGR -> no cvtColor needed
+                    "size": (self.WIDTH, self.HEIGHT),
+                    # See the note above - RGB888 is what OpenCV wants.
+                    "format": "RGB888",
                 },
-                controls={
-                    # Lock framerate: both min and max to FPS (prevents dipping)
-                    "FrameRate": self.FPS,
-
-                    # -- Manual focus — critical for gesture recognition ---
-                    # AfMode 0 = Manual; prevents the lens from continuously
-                    # hunting for focus, which causes blur during fast hand
-                    # movements and can drop the effective FPS significantly.
-                    "AfMode":       0,                  # 0=Manual, 2=Continuous
-                    "LensPosition": self.LENS_POSITION, # Fixed focal distance
-                },
-                # Optimise internal queue depth for low-latency live capture
+                controls={"FrameRate": self.FPS},
                 buffer_count=4,
             )
+
+            # queue=False is not supported by every Picamera2 version, and it
+            # is a latency optimisation rather than a requirement, so losing
+            # it must not lose the camera.
+            try:
+                video_config = picam.create_video_configuration(
+                    queue=False, **config_kwargs)
+            except TypeError:
+                video_config = picam.create_video_configuration(**config_kwargs)
 
             picam.configure(video_config)
             picam.start()
 
+            # Manual focus, best-effort. Continuous autofocus is actively
+            # harmful here: the lens hunts during fast hand movement, which
+            # both blurs the frame and costs frame rate.
+            focus_note = "fixed-focus module (no AF controls)"
+            try:
+                picam.set_controls({"AfMode": 0,
+                                    "LensPosition": self.LENS_POSITION})
+                focus_note = f"LensPosition={self.LENS_POSITION} (manual focus)"
+            except Exception:
+                pass
+
             self._cam     = picam
             self._backend = self.BACKEND_PICAMERA2
-            print(
-                f"[SmartCamera] Picamera2 started — "
-                f"{self.WIDTH}x{self.HEIGHT} @ {self.FPS} FPS, "
-                f"LensPosition={self.LENS_POSITION} (manual focus)"
-            )
+
+            # Report what the camera actually configured, not what was asked
+            # for - the same rule the USB path learned the hard way.
+            try:
+                actual = picam.camera_configuration()["main"]
+                got_w, got_h = actual["size"]
+                got_fmt = actual["format"]
+            except Exception:
+                got_w, got_h, got_fmt = self.WIDTH, self.HEIGHT, "RGB888"
+
+            # "@ N fps" here is the REQUESTED rate - the sensor may clamp it to
+            # what the chosen mode supports. Labelled as such rather than
+            # stated as fact; `npm run bench` measures what really arrives.
+            print(f"[SmartCamera] Picamera2 started — {got_w}x{got_h} "
+                  f"{got_fmt}, {self.FPS} fps requested, {focus_note}")
+            if (got_w, got_h) != (self.WIDTH, self.HEIGHT):
+                print(f"[SmartCamera] [!] requested {self.WIDTH}x{self.HEIGHT}; "
+                      f"the sensor mode nearest to it was chosen instead.")
 
         except ImportError:
-            print(
-                "[SmartCamera] Picamera2 not found (ImportError). "
-                "Falling back to OpenCV VideoCapture."
-            )
-            self._start_opencv()
+            print("[SmartCamera] picamera2 is not installed.")
+            if self._explicit_picamera:
+                # Explicitly asked for the Pi camera: do NOT quietly record
+                # from some other lens. Mixing cameras in one dataset shifts
+                # every landmark and is very hard to notice afterwards.
+                print("[SmartCamera] Install it on the Pi with:")
+                print("[SmartCamera]     sudo apt install -y python3-picamera2")
+                print("[SmartCamera] (apt, not pip - it is built against the")
+                print("[SmartCamera]  system libcamera stack.)")
+                print("[SmartCamera] If you are on the laptop, pick option 1-4.")
+                self._cam = None
+                self._backend = None
+            else:
+                print("[SmartCamera] Falling back to OpenCV VideoCapture.")
+                self._start_opencv()
 
         except Exception as exc:
-            print(
-                f"[SmartCamera] Picamera2 failed to initialise ({exc}). "
-                f"Falling back to OpenCV VideoCapture."
-            )
-            self._start_opencv()
+            print(f"[SmartCamera] Picamera2 failed to initialise ({exc}).")
+            if self._explicit_picamera:
+                print("[SmartCamera] Checklist:")
+                print("   1. Ribbon cable seated in the CSI port, contacts")
+                print("      facing the right way (they are easy to reverse).")
+                print("   2. `libcamera-hello --list-cameras` sees the module.")
+                print("   3. Nothing else is holding the camera open.")
+                self._cam = None
+                self._backend = None
+            else:
+                print("[SmartCamera] Falling back to OpenCV VideoCapture.")
+                self._start_opencv()
 
     def _read_picamera2(self):
         """
         Capture one frame from Picamera2 and return it as a BGR numpy array.
         """
         try:
-            # capture_array("main") returns a numpy array in the configured
-            # pixel format: BGR888 -> shape (H, W, 3), dtype uint8
+            # capture_array("main") returns shape (H, W, 3), dtype uint8.
+            # The stream is configured as "RGB888", which - per libcamera's
+            # inverted naming - is the format that yields (B, G, R) channel
+            # order. So this really is BGR, matching every other backend and
+            # the rest of the pipeline. No conversion needed or wanted.
             frame = self._cam.capture_array("main")
             if frame is None or frame.size == 0:
                 return False, None
@@ -624,20 +1077,26 @@ class SmartCamera:
                     "Check that a webcam is connected and not in use."
                 )
 
-            # Pin resolution to match the Pi production stream
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.WIDTH)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.HEIGHT)
+            # MJPG BEFORE resolution. Most UVC webcams default to raw YUY2,
+            # whose bandwidth caps 640x480 at 30 fps and higher modes lower
+            # still; the same sensor will happily deliver 60 fps as MJPG. This
+            # is the one setting that raises the DELIVERY rate, which is what
+            # keeps MediaPipe from losing the hand between frames.
+            self._negotiate_format(cap)
 
             # Confirm what the driver actually provided (may differ on some webcams)
             actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            actual_fps = cap.get(cv2.CAP_PROP_FPS)
 
             self._cam     = cap
             self._backend = self.BACKEND_OPENCV
             print(
                 f"[SmartCamera] OpenCV VideoCapture started — "
-                f"requested {self.WIDTH}x{self.HEIGHT}, "
+                f"requested {self.WIDTH}x{self.HEIGHT}@{self.FPS}, "
                 f"driver returned {actual_w}x{actual_h}"
+                f"@{actual_fps:.0f}" if actual_fps else
+                f"requested {self.WIDTH}x{self.HEIGHT}, got {actual_w}x{actual_h}"
             )
 
         except Exception as exc:
@@ -704,12 +1163,14 @@ class SmartCamera:
                     cap.release()
                     continue
 
-                if force_mjpg:
-                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
                 # Ask the driver to hand us BGR rather than raw YUV planes.
                 cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.WIDTH)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.HEIGHT)
+                if force_mjpg:
+                    self._negotiate_format(cap)
+                else:
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.WIDTH)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.HEIGHT)
+                    cap.set(cv2.CAP_PROP_FPS, self.FPS)
 
                 # "Opened" is not the same as "working": a virtual camera whose
                 # source app is idle opens happily and then never sends a frame.
@@ -736,8 +1197,14 @@ class SmartCamera:
                 h, w = frame.shape[:2]
                 self._cam = cap
                 self._backend = self.BACKEND_USB_DSHOW
+                # Report the format that was NEGOTIATED, not the one requested.
+                # "started via CAP_DSHOW + MJPG" while the device was actually
+                # handing over YUY2 is how a 20 fps ceiling stayed hidden for
+                # two rounds of debugging. A log that flatters the request is
+                # worse than no log.
                 print(f"[SmartCamera] Camera index {self._device_index} started "
-                      f"via {name} — {w}x{h}")
+                      f"via {name.split(' +')[0]} — {w}x{h} "
+                      f"{self._fourcc_tag(cap)}")
                 return
 
             except Exception as exc:
@@ -841,7 +1308,13 @@ if __name__ == "__main__":
 # Words that appear in the NAME of a camera soldered into a laptop lid. Anything
 # without one of these had to be plugged in.
 _INTEGRATED_HINTS = ("integrated", "built-in", "builtin", "internal",
-                     "facetime", "user facing", "front camera", "laptop")
+                     "facetime", "user facing", "front camera", "laptop",
+                     "true vision", "hd user-facing", "ir camera")
+
+# Vendors name lid cameras whatever they like ("HP True Vision FHD Camera"),
+# so no keyword list will ever be complete. When nothing matches by name, the
+# lowest index is the built-in one - which is the rule that held before names
+# were available at all.
 
 
 def camera_device_names() -> tuple:
@@ -917,6 +1390,10 @@ def describe_cameras() -> list:
             kind = "integrated" if idx == 0 else "usb"
         out.append({"index": idx, "width": w, "height": h,
                     "name": name, "kind": kind, "exact": bool(name) and exact})
+
+    if out and not any(c["kind"] == "integrated" for c in out):
+        lowest = min(out, key=lambda c: c["index"])
+        lowest["kind"] = "integrated"
     return out
 
 
@@ -962,6 +1439,9 @@ def choose_camera_interactive(*, allow_prompt: bool = True):
         print("\nCamera: auto  (no input available — set CAMERA_SOURCE in .env)")
         return "auto"
 
+    on_pi = _is_raspberry_pi()
+    pi_cam = picamera2_available()
+
     print("\n" + "=" * 60)
     print("  Select camera")
     print("=" * 60)
@@ -969,14 +1449,43 @@ def choose_camera_interactive(*, allow_prompt: bool = True):
     print("  2. External USB webcam           (plugged in)")
     print("  3. DroidCam / phone")
     print("  4. Other stream URL")
+    if pi_cam:
+        print("  5. Raspberry Pi Camera           (Module 3 / CSI, Picamera2)")
+    elif on_pi:
+        print("  5. Raspberry Pi Camera           [picamera2 NOT installed]")
     print()
 
+    # On the Pi the CSI module is the point of the exercise, so make it the
+    # default there and leave the USB webcam as the default on the laptop.
+    default = "5" if pi_cam else "2"
+
     try:
-        return _camera_menu()
+        return _camera_menu(default=default, pi_cam=pi_cam, on_pi=on_pi)
     except (EOFError, KeyboardInterrupt):
         # stdin closed under us, or the user pressed Ctrl-C at the prompt.
         print("\nCamera: auto  (no answer given)")
         return "auto"
+
+
+def picamera2_available() -> bool:
+    """
+    True when the CSI camera stack can actually be used.
+
+    Deliberately checks that picamera2 IMPORTS rather than that the machine
+    looks like a Pi. A Pi with the library missing and a laptop without it
+    fail in the same way, and both need to be steered to a different option
+    rather than into a traceback.
+
+    importlib.util.find_spec avoids paying the (slow) picamera2 import just
+    to answer a menu question.
+    """
+    if _is_raspberry_pi() is False and sys.platform == "win32":
+        return False          # fast path: never available on Windows
+    try:
+        import importlib.util
+        return importlib.util.find_spec("picamera2") is not None
+    except Exception:
+        return False
 
 
 def _stdin_readable() -> bool:
@@ -991,10 +1500,18 @@ def _stdin_readable() -> bool:
     return True
 
 
-def _camera_menu():
-    """The question loop itself. Raises EOFError if stdin ends."""
+def _camera_menu(default: str = "2", pi_cam: bool = False,
+                 on_pi: bool = False):
+    """
+    The question loop itself. Raises EOFError if stdin ends.
+
+    `pi_cam`/`on_pi` are passed in rather than re-probed so the menu shown and
+    the choices accepted can never disagree - offering an option that is then
+    rejected is a small thing that feels broken.
+    """
+    top = "5" if (pi_cam or on_pi) else "4"
     while True:
-        choice = input("Choice [1-4, default 2]: ").strip() or "2"
+        choice = input(f"Choice [1-{top}, default {default}]: ").strip() or default
 
         if choice in ("1", "2"):
             want = "integrated" if choice == "1" else "usb"
@@ -1103,4 +1620,23 @@ def _camera_menu():
             print("  [!] Must be a full URL, e.g. http://192.168.8.177:4747/video")
             continue
 
-        print("  [!] Enter 1, 2, 3 or 4.")
+        if choice == "5":
+            if pi_cam:
+                print("\n  [Raspberry Pi Camera — CSI / Picamera2]")
+                print(f"   Capturing at {SmartCamera.WIDTH}x{SmartCamera.HEIGHT}"
+                      f" @ {SmartCamera.FPS} fps (CAMERA_WIDTH / CAMERA_HEIGHT")
+                print("   / CAMERA_FPS in .env change this).")
+                print("   Focus is locked to avoid the lens hunting mid-sign.")
+                return "picamera"
+
+            if on_pi:
+                print("\n   [!] picamera2 is not installed on this Pi.")
+                print("       sudo apt install -y python3-picamera2")
+                print("       Use apt, NOT pip: it is built against the system")
+                print("       libcamera stack and the pip build will not work.")
+            else:
+                print("\n   [!] This is not a Raspberry Pi — there is no CSI")
+                print("       camera here. Use 1-4 on the laptop.")
+            continue
+
+        print(f"  [!] Enter a number from 1 to {top}.")

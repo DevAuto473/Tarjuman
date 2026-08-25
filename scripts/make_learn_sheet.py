@@ -19,17 +19,30 @@ opens Arabic CSVs as mojibake — the single most common reason a perfectly good
 export "doesn't work".
 """
 
+# -- Import bootstrap ---------------------------------------------------------
+# Puts src/ on the path so `tarjuman_core` resolves when this file is run
+# directly (`python make_learn_sheet.py`). Running through `npm run ...` sets PYTHONPATH
+# instead, and `pip install -e .` makes both unnecessary - this is the belt to
+# those braces, so a plain `python` invocation never fails with ImportError.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "src")
+    if _os.path.basename(_os.path.dirname(_os.path.abspath(__file__))) == "scripts"
+    else _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "src"))
+
 import csv
 import os
 import sys
 
-from vocabulary import (
+from tarjuman_core.paths import data
+from tarjuman_core.vocabulary import (
     LOCATION_AR, MOTION_AR, ORIENT_AR, SHAPE_AR,
     as_dicts, category_of, signature, validate,
 )
 
-DATA_CSV   = "dynamic_gestures_v4.csv"
-OUTPUT_CSV = "learn.csv"
+DATA_CSV   = data("dynamic_gestures_v4.csv")
+OUTPUT_CSV = data("learn.csv")
 TARGET_PER_LABEL = 30
 
 DONE_MARK    = "✔"

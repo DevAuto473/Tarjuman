@@ -19,7 +19,7 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -93,6 +93,11 @@ const child = spawn(cmd, [scriptPath, ...scriptArgs], {
     // its own progress output — which reads as "it printed nothing and made no
     // files". 'replace' guarantees a substituted character instead of a crash.
     PYTHONIOENCODING: 'utf-8:replace',
+    // src/ holds the tarjuman_core package. Putting it on the path here means
+    // every npm script works straight from a clone, with no `pip install -e .`
+    // step and no sys.path lines in the scripts themselves.
+    PYTHONPATH: [join(projectRoot, 'src'), process.env.PYTHONPATH]
+      .filter(Boolean).join(delimiter),
   },
 });
 

@@ -39,6 +39,18 @@ Limitations, stated plainly
     come out rotated, adjust ARM_BASE_* below rather than the maths.
 """
 
+# -- Import bootstrap ---------------------------------------------------------
+# Puts src/ on the path so `tarjuman_core` resolves when this file is run
+# directly (`python export_signs_3d.py`). Running through `npm run ...` sets PYTHONPATH
+# instead, and `pip install -e .` makes both unnecessary - this is the belt to
+# those braces, so a plain `python` invocation never fails with ImportError.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "src")
+    if _os.path.basename(_os.path.dirname(_os.path.abspath(__file__))) == "scripts"
+    else _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "src"))
+
 import csv
 import json
 import os
@@ -46,11 +58,12 @@ import sys
 
 import numpy as np
 
-from dtw_matcher import SignReferenceLibrary
-from feature_extractor import SEQUENCE_LENGTH
+from tarjuman_core.paths import data, FRONTEND_DIR
+from tarjuman_core.dtw_matcher import SignReferenceLibrary
+from tarjuman_core.feature_extractor import SEQUENCE_LENGTH
 
-INPUT_CSV   = os.environ.get("TARJUMAN_CSV", "dynamic_gestures_v4.csv")
-OUTPUT_JSON = os.path.join("tarjuman", "public", "trained_signs.json")
+INPUT_CSV   = os.environ.get("TARJUMAN_CSV", data("dynamic_gestures_v4.csv"))
+OUTPUT_JSON = str(FRONTEND_DIR / "public" / "trained_signs.json")
 
 # How many key poses to keep per sign. The player interpolates between them, so
 # a handful of well-chosen moments reproduce the movement; storing all 30 frames
@@ -64,7 +77,7 @@ KEYFRAMES_PER_SIGN = 6
 # would drift, and a drift there means recorded signs and live mirroring move
 # differently with nothing in the logs to explain it.
 
-from pose_to_bones import frame_to_bone_dirs   # noqa: E402
+from tarjuman_core.pose_to_bones import frame_to_bone_dirs   # noqa: E402
 
 
 def frame_to_pose(frame) -> dict:
@@ -94,7 +107,7 @@ def sequence_to_sign(seq: np.ndarray, duration: float = 1.4) -> dict:
 def arabic_names() -> dict:
     """id -> Arabic word, taken from vocabulary.py when available."""
     try:
-        from vocabulary import as_dicts
+        from tarjuman_core.vocabulary import as_dicts
         return {e["id"]: e["arabic"] for e in as_dicts()}
     except Exception:
         return {}
@@ -102,7 +115,7 @@ def arabic_names() -> dict:
 
 def mean_duration(csv_path: str) -> dict:
     """Average recorded duration per label, so playback matches real timing."""
-    from feature_extractor import TOTAL_FEATURES
+    from tarjuman_core.feature_extractor import TOTAL_FEATURES
     sums, counts = {}, {}
     try:
         with open(csv_path, newline="", encoding="utf-8") as f:

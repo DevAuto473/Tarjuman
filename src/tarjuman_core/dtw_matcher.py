@@ -30,7 +30,7 @@ import os
 
 import numpy as np
 
-from feature_extractor import (
+from tarjuman_core.feature_extractor import (
     FRAME_FEATURES,
     SEQUENCE_LENGTH,
     TOTAL_FEATURES,

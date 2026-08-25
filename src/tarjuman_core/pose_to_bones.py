@@ -46,7 +46,7 @@ Three things this module guarantees
 
 import numpy as np
 
-from feature_extractor import HAND_SHAPE_VALS, N_HAND_LANDMARKS
+from tarjuman_core.feature_extractor import HAND_SHAPE_VALS, N_HAND_LANDMARKS
 
 # Finger chains as MediaPipe landmark indices.
 FINGER_CHAINS = {
@@ -462,7 +462,7 @@ def frame_to_bone_dirs(frame) -> dict:
     Values are three numbers (a direction) except hand bones, which carry six
     (direction + palm normal). The player tells them apart by length.
     """
-    from feature_extractor import VALS_PER_HAND
+    from tarjuman_core.feature_extractor import VALS_PER_HAND
 
     pose = {}
     frame = np.asarray(frame, dtype=np.float32)

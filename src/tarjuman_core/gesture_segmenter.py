@@ -38,7 +38,7 @@ import collections
 
 import numpy as np
 
-from feature_extractor import (
+from tarjuman_core.feature_extractor import (
     SEQUENCE_LENGTH,
     VALS_PER_FRAME,
     VALS_PER_HAND,
@@ -46,9 +46,26 @@ from feature_extractor import (
     compute_global_features,
 )
 
-# Nominal capture rate, used to convert a frame count into seconds when the
-# caller does not supply real timing. Overridden by passing `now` to update().
-ASSUMED_FPS = 20.0
+# The rate every threshold below was originally tuned at, and the rate the
+# existing dataset was recorded at. It is now a REFERENCE point rather than an
+# assumption: the segmenter measures the real frame rate and rescales itself, so
+# raising the capture rate no longer changes when a gesture starts or ends.
+#
+# Why that matters more than it sounds
+# ------------------------------------
+# Every threshold used to be counted in FRAMES. At 20 fps "5 still frames" is a
+# quarter-second pause; at 45 fps it is a tenth, so signs would be chopped off
+# mid-motion. And a per-frame speed threshold gets HARDER to trip as the rate
+# rises, because each frame covers less ground - so a faster camera would have
+# silently stopped detecting slow signs at all. Worse, the speed and duration
+# features feed the model, so a model trained at 20 fps would quietly mispredict
+# at 45. Raising fps without this change would have broken the dataset.
+REFERENCE_FPS = 20.0
+ASSUMED_FPS = REFERENCE_FPS      # kept: older callers import this name
+
+# Bounds for the measured rate, so one hiccuped frame cannot warp the thresholds.
+MIN_TRACKED_FPS = 5.0
+MAX_TRACKED_FPS = 120.0
 
 
 # -----------------------------------------------------------------------------
@@ -57,34 +74,46 @@ ASSUMED_FPS = 20.0
 # Speeds are in normalised image units per frame (a wrist crossing the whole
 # frame in 1 s at 30 fps ≈ 0.033/frame). Calibrate on the real Pi camera.
 
-MOTION_START_SPEED = 0.012   # begin capturing above this wrist speed
+# Expressed per SECOND now. 0.012 per frame at 20 fps is the same motion as
+# 0.24 per second, so behaviour at 20 fps is unchanged to the last decimal.
+MOTION_START_SPEED_PER_S = 0.012 * REFERENCE_FPS      # 0.24 units/second
+MOTION_START_SPEED = 0.012   # per-frame equivalent at REFERENCE_FPS
 
 # A slow, deliberate sign never exceeds MOTION_START_SPEED on any single frame,
 # yet it clearly travels. Speed alone would silently ignore it entirely — so we
 # ALSO trigger on total displacement away from where the hand was resting.
+# DISTANCES are deliberately NOT rescaled. How far a hand has drifted is the
+# same physical fact whatever rate you sample it at; only rates and durations
+# depend on the clock. Scaling these too would have been a real bug.
 MOTION_START_DISPLACEMENT = 0.045   # cumulative drift from the resting anchor
-ANCHOR_HISTORY_FRAMES     = 12      # how far back the resting anchor looks
+ANCHOR_HISTORY_S          = 12 / REFERENCE_FPS   # 0.60 s of resting history
+ANCHOR_HISTORY_FRAMES     = 12      # equivalent at REFERENCE_FPS
 
-STILL_FRAMES_TO_END = 5      # window (in frames) used to judge stillness
+STILL_WINDOW_S = 5 / REFERENCE_FPS   # 0.25 s of stillness ends a gesture
+STILL_FRAMES_TO_END = 5      # equivalent at REFERENCE_FPS
 
 # Stillness is judged by TOTAL travel across the last STILL_FRAMES_TO_END
 # frames, not by instantaneous speed. Per-frame speed is unusable here: a very
 # slow sign moves less per frame than sensor noise, so a speed threshold would
 # declare it "finished" mid-gesture and truncate it.
 STILL_DISPLACEMENT = 0.018   # travel below this over the window = hand at rest
-MIN_GESTURE_FRAMES  = 6      # shorter than this = twitch/noise, discarded
+MIN_GESTURE_S      = 6 / REFERENCE_FPS    # 0.30 s - shorter is a twitch
+MIN_GESTURE_FRAMES = 6       # equivalent at REFERENCE_FPS
 
 # Sensor noise occasionally spikes past the start threshold, producing short
 # "gestures" that never actually went anywhere. A real sign always travels —
 # in position, in finger configuration, or both. Segments whose peak deviation
 # from their own first frame stays under this are discarded as noise.
 MIN_GESTURE_TRAVEL = 0.040
-MAX_GESTURE_FRAMES  = 90     # hard stop (~3-4 s) so a stuck state can't grow
-COOLDOWN_FRAMES     = 3      # brief pause after emitting, avoids double-fire
+MAX_GESTURE_S      = 90 / REFERENCE_FPS   # 4.5 s hard stop
+MAX_GESTURE_FRAMES = 90      # equivalent at REFERENCE_FPS
+COOLDOWN_S         = 3 / REFERENCE_FPS    # 0.15 s pause, avoids double-fire
+COOLDOWN_FRAMES    = 3       # equivalent at REFERENCE_FPS
 
 # Frames kept before motion is detected. A sign's first moments happen just
 # before the speed threshold trips, so we prepend a little history.
-PRE_ROLL_FRAMES = 4
+PRE_ROLL_S = 4 / REFERENCE_FPS       # 0.20 s of onset kept before the trigger
+PRE_ROLL_FRAMES = 4          # equivalent at REFERENCE_FPS
 
 
 # -----------------------------------------------------------------------------
@@ -251,6 +280,36 @@ class GestureSegmenter:
         self.cooldown_count = 0
         self.last_speed = 0.0
 
+        # Measured capture rate, smoothed. Starts at the reference rate so the
+        # very first frames behave exactly as before rather than as an outlier.
+        self.fps = REFERENCE_FPS
+        self.dt = 1.0 / REFERENCE_FPS
+        self._last_now = None
+
+    # -- Frame-rate tracking -------------------------------------------------
+
+    def _tick(self, now):
+        """Update the measured frame rate and resize the frame-count windows."""
+        if now is not None and self._last_now is not None:
+            gap = now - self._last_now
+            if 1.0 / MAX_TRACKED_FPS <= gap <= 1.0 / MIN_TRACKED_FPS:
+                # Exponential smoothing: a single late frame (a GC pause, a
+                # dropped USB packet) must not yank every threshold with it.
+                self.fps += (1.0 / gap - self.fps) * 0.15
+        self._last_now = now
+        self.dt = 1.0 / max(self.fps, 1e-6)
+
+        # deques are sized in frames, so they follow the measured rate.
+        want_anchor = max(2, round(ANCHOR_HISTORY_S * self.fps))
+        if self.anchor_history.maxlen != want_anchor:
+            self.anchor_history = collections.deque(self.anchor_history,
+                                                    maxlen=want_anchor)
+        want_pre = max(1, round(PRE_ROLL_S * self.fps))
+        if self.pre_roll.maxlen != want_pre:
+            self.pre_roll = collections.deque(self.pre_roll, maxlen=want_pre)
+            self.pre_roll_times = collections.deque(self.pre_roll_times,
+                                                    maxlen=want_pre)
+
     # -- Public API ----------------------------------------------------------
 
     def reset(self) -> None:
@@ -258,6 +317,7 @@ class GestureSegmenter:
         self.state = IDLE
         self.buffer = []
         self.buffer_times = []
+        self._last_now = None
         self.pre_roll.clear()
         self.pre_roll_times.clear()
         self.anchor_history.clear()
@@ -289,13 +349,15 @@ class GestureSegmenter:
             self.reset()
             return None
 
+        self._tick(now)
+
         speed = _motion(frame_features, self.prev_frame)
         self.last_speed = speed
         self.prev_frame = frame_features
 
         if self.state == COOLDOWN:
             self.cooldown_count += 1
-            if self.cooldown_count >= COOLDOWN_FRAMES:
+            if self.cooldown_count >= max(1, round(COOLDOWN_S * self.fps)):
                 self.state = IDLE
                 self.cooldown_count = 0
             self.pre_roll.append(frame_features)
@@ -313,7 +375,11 @@ class GestureSegmenter:
             anchor = self.anchor_history[0] if self.anchor_history else None
             drifted = _displacement(frame_features, anchor) > MOTION_START_DISPLACEMENT
 
-            if speed > MOTION_START_SPEED or drifted:
+            # Speed is a per-frame displacement, so the threshold has to be
+            # scaled by how long a frame lasts. Without this, doubling the frame
+            # rate halves the distance covered per frame and the trigger simply
+            # stops firing for anything but a very fast sign.
+            if speed > MOTION_START_SPEED_PER_S * self.dt or drifted:
                 # Start with the pre-roll so the sign's onset isn't clipped
                 self.buffer = list(self.pre_roll)
                 self.buffer_times = list(self.pre_roll_times)
@@ -331,12 +397,13 @@ class GestureSegmenter:
         # Stillness = how far the wrist travelled across the whole window.
         # Using cumulative travel (not per-frame speed) is what lets a very
         # slow sign keep recording instead of being cut off mid-gesture.
+        still_window = max(2, round(STILL_WINDOW_S * self.fps))
         at_rest = False
-        if len(self.buffer) > STILL_FRAMES_TO_END:
-            window_start = self.buffer[-(STILL_FRAMES_TO_END + 1)]
+        if len(self.buffer) > still_window:
+            window_start = self.buffer[-(still_window + 1)]
             at_rest = _displacement(frame_features, window_start) < STILL_DISPLACEMENT
 
-        ended = at_rest or len(self.buffer) >= MAX_GESTURE_FRAMES
+        ended = at_rest or len(self.buffer) >= round(MAX_GESTURE_S * self.fps)
         if not ended:
             return None
 
@@ -348,7 +415,7 @@ class GestureSegmenter:
         self.cooldown_count = 0
         self.still_count = 0
 
-        if len(captured) < MIN_GESTURE_FRAMES:
+        if len(captured) < max(2, round(MIN_GESTURE_S * self.fps)):
             return None      # twitch, not a sign
 
         # Reject segments that never meaningfully moved (sensor noise spikes)
@@ -360,7 +427,8 @@ class GestureSegmenter:
         # Real elapsed time when the caller supplied timestamps, otherwise
         # inferred from the frame count.
         stamps = [t for t in times if t is not None]
-        duration = (stamps[-1] - stamps[0]) if len(stamps) >= 2 else (len(captured) / ASSUMED_FPS)
+        duration = ((stamps[-1] - stamps[0]) if len(stamps) >= 2
+                    else len(captured) / self.fps)
         duration = max(duration, 1e-3)
 
         # Globals are computed on the RAW capture — resampling would erase them

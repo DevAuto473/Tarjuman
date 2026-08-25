@@ -39,6 +39,18 @@ requirements.txt — the Raspberry Pi only ever runs onnxruntime.
     considerably more data than a forest to beat it.
 """
 
+# -- Import bootstrap ---------------------------------------------------------
+# Puts src/ on the path so `tarjuman_core` resolves when this file is run
+# directly (`python train_model_cnn.py`). Running through `npm run ...` sets PYTHONPATH
+# instead, and `pip install -e .` makes both unnecessary - this is the belt to
+# those braces, so a plain `python` invocation never fails with ImportError.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "src")
+    if _os.path.basename(_os.path.dirname(_os.path.abspath(__file__))) == "scripts"
+    else _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "src"))
+
 import json
 import os
 import sys
@@ -59,7 +71,8 @@ from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
-from feature_extractor import (
+from tarjuman_core.paths import data, root
+from tarjuman_core.feature_extractor import (
     FRAME_FEATURES, N_GLOBAL_FEATURES, SEQUENCE_LENGTH, TOTAL_FEATURES, VALS_PER_FRAME,
 )
 
@@ -68,9 +81,9 @@ from feature_extractor import (
 #  Configuration
 # -----------------------------------------------------------------------------
 
-INPUT_CSV       = os.environ.get("TARJUMAN_CSV", "dynamic_gestures_v4.csv")
-ONNX_MODEL_PATH = "sign_model_cnn.onnx"
-LABELS_JSON     = "labels.json"
+INPUT_CSV       = os.environ.get("TARJUMAN_CSV", data("dynamic_gestures_v4.csv"))
+ONNX_MODEL_PATH = root("sign_model_cnn.onnx")
+LABELS_JSON     = data("labels.json")
 
 EPOCHS        = 120
 BATCH_SIZE    = 32

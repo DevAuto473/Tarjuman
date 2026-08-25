@@ -241,7 +241,11 @@ def split_hands(results):
 # Pose is markedly slower than Hands, and a seated signer's torso barely moves
 # between frames. Running it every Nth frame and reusing the last anchors keeps
 # the reference accurate while cutting most of the cost — important on a Pi.
-POSE_EVERY_N_FRAMES = 3
+# Measured at 24 ms per Pose call, which is 8 ms amortised at 1-in-3 - a sixth
+# of the whole frame budget spent locating shoulders that barely move between
+# frames. 1-in-5 costs 4.8 ms and the anchors are cached in between, so nothing
+# downstream can tell the difference.
+POSE_EVERY_N_FRAMES = 5
 
 # Below this, the pose is treated as unreliable (person turned away, occluded).
 MIN_POSE_VISIBILITY = 0.5
@@ -539,12 +543,43 @@ def _hand_openness(hand_block: list) -> float:
     return float(np.mean(np.abs(relative)))
 
 
+# The sampling density these features are DEFINED at. Speed, path length and
+# openness range are all measured from frame-to-frame steps, so they depend on
+# how finely the motion was sampled: the same sign recorded at 30 fps yields a
+# 5-21% different peak_speed than at 20 fps. Left alone, that turns capture rate
+# into a hidden input the model was never meant to see - and since the existing
+# dataset was recorded at 20 fps, running inference at 30 would quietly feed the
+# model out-of-distribution values.
+#
+# Normalising to a fixed density removes the dependence entirely, and 20 is
+# chosen so previously recorded data remains exactly what it always was.
+GLOBALS_REFERENCE_FPS = 20.0
+
+
+def _resample_to_rate(arr, duration_seconds: float):
+    """Re-grid a capture to GLOBALS_REFERENCE_FPS, whatever rate it arrived at."""
+    target = max(2, int(round(duration_seconds * GLOBALS_REFERENCE_FPS)))
+    n = arr.shape[0]
+    if n == target:
+        return arr
+    idx = np.linspace(0.0, n - 1, target)
+    lo = np.floor(idx).astype(int)
+    hi = np.minimum(lo + 1, n - 1)
+    w = (idx - lo).astype(np.float32)[:, None]
+    return arr[lo] * (1.0 - w) + arr[hi] * w
+
+
 def compute_global_features(frames, duration_seconds: float) -> list[float]:
     """
     Summarise a whole gesture into N_GLOBAL_FEATURES values.
 
-    MUST be called on the RAW captured frames, before resampling — the point of
-    these features is to preserve exactly what resampling throws away.
+    MUST be called on the RAW captured frames, before the sequence is resampled
+    to SEQUENCE_LENGTH — the point of these features is to preserve exactly what
+    that resampling throws away.
+
+    The raw frames ARE, however, re-gridded to a fixed sampling density first.
+    That is a different operation and it is what makes these values comparable
+    across capture rates: without it, a faster camera reports a faster sign.
 
     Parameters
     ----------
@@ -555,8 +590,11 @@ def compute_global_features(frames, duration_seconds: float) -> list[float]:
     if arr.ndim != 2 or arr.shape[0] < 2:
         return [0.0] * N_GLOBAL_FEATURES
 
-    n_frames = arr.shape[0]
     duration = max(float(duration_seconds), 1e-3)
+    arr = _resample_to_rate(arr, duration)
+    if arr.shape[0] < 2:
+        return [duration] + [0.0] * (N_GLOBAL_FEATURES - 1)
+    n_frames = arr.shape[0]
 
     # -- Wrist trajectory (whichever hand is present, averaged) --------------
     positions = []

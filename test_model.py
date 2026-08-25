@@ -17,6 +17,18 @@ points at the model rather than at the plumbing.
 Controls:  q = quit   ·   r = reset the segmenter   ·   space = pause
 """
 
+# -- Import bootstrap ---------------------------------------------------------
+# Puts src/ on the path so `tarjuman_core` resolves when this file is run
+# directly (`python test_model.py`). Running through `npm run ...` sets PYTHONPATH
+# instead, and `pip install -e .` makes both unnecessary - this is the belt to
+# those braces, so a plain `python` invocation never fails with ImportError.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "src")
+    if _os.path.basename(_os.path.dirname(_os.path.abspath(__file__))) == "scripts"
+    else _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "src"))
+
 import json
 import os
 import sys
@@ -34,15 +46,17 @@ except ImportError:
     print("       venv\\Scripts\\pip install -r requirements.txt")
     sys.exit(1)
 
-from camera_manager import SmartCamera, choose_camera_interactive
-from feature_extractor import (
+from tarjuman_core.paths import data, root
+from tarjuman_core.camera_manager import SmartCamera, choose_camera_interactive
+from tarjuman_core.feature_extractor import (
     TOTAL_FEATURES, PoseTracker, extract_frame_features, prepare_frame,
     split_hands,
 )
-from gesture_segmenter import GestureSegmenter
+from tarjuman_core.gesture_segmenter import GestureSegmenter
+from tarjuman_core.runtime_check import check_mediapipe_stack
 
-ONNX_MODEL_PATH = "sign_model.onnx"
-LABELS_JSON     = "labels.json"
+ONNX_MODEL_PATH = root("sign_model.onnx")
+LABELS_JSON     = data("labels.json")
 TOP_K           = 3          # how many candidates to show
 HISTORY_LEN     = 6          # recent results kept on screen
 
@@ -108,7 +122,7 @@ def text(img, s, pos, colour=C_WHITE, scale=0.6, thick=2):
 
 
 def draw_hud(frame, *, hands_ok, body_ok, capturing, captured, last, history,
-             fps, threshold):
+             fps, threshold, stage_ms=None):
     h, w = frame.shape[:2]
 
     panel = frame.copy()
@@ -123,6 +137,30 @@ def draw_hud(frame, *, hands_ok, body_ok, capturing, captured, last, history,
     text(frame, f"Body: {'YES' if body_ok else 'NO'}",
          (170, 28), C_GREEN if body_ok else C_AMBER, 0.6)
     text(frame, f"{fps:4.1f} fps", (w - 110, 28), C_GREY, 0.55)
+
+    # Where the milliseconds go, on screen and live. A single fps number tells
+    # you that something is slow; this tells you WHICH thing, without having to
+    # stop and run a separate benchmark.
+    if stage_ms:
+        import numpy as _np
+        parts = []
+        for key, label in (("read", "cam"), ("hands", "hands"),
+                           ("pose", "pose"), ("draw", "draw"), ("show", "show")):
+            vals = stage_ms.get(key)
+            if vals:
+                parts.append(f"{label} {_np.mean(vals):.0f}")
+        if parts:
+            text(frame, "  ".join(parts) + " ms", (w - 300, 50), C_GREY, 0.42)
+
+        # When the camera wait dominates, the bottleneck is the SENSOR, not the
+        # code - and in a dim room that is almost always auto-exposure halving
+        # the frame rate. Saying so on screen saves running a benchmark to
+        # rediscover it every time the sun goes down.
+        cam_ms = float(_np.mean(stage_ms["read"])) if stage_ms.get("read") else 0.0
+        busy = sum(float(_np.mean(stage_ms[k])) for k in
+                   ("hands", "pose", "draw", "show") if stage_ms.get(k))
+        if cam_ms > busy:
+            text(frame, "camera-bound: add light", (w - 300, 68), C_AMBER, 0.42)
 
     if capturing:
         text(frame, f"RECORDING GESTURE  [{captured} frames]", (12, 60), C_RED, 0.7)
@@ -161,6 +199,12 @@ def main() -> int:
     print("  TARJUMAN — LIVE MODEL TEST")
     print("=" * 62)
 
+    # Before anything else. The protobuf/mediapipe mismatch only fires when a
+    # solution graph is constructed, which used to happen AFTER the camera
+    # menu - so you picked a camera, waited for it to open, and only then hit
+    # a traceback. Failing here costs microseconds and wastes none of that.
+    check_mediapipe_stack()
+
     sess, in_name, prob_name, labels = load_model()
 
     threshold = float(os.getenv("CONFIDENCE_THRESHOLD", "0.65"))
@@ -173,6 +217,10 @@ def main() -> int:
     source = choose_camera_interactive()
     cam = SmartCamera(source=source)
     cam.start()
+    # Decode frames in the background. read() then returns the NEWEST frame
+    # instead of blocking until the sensor produces one, so capture and
+    # MediaPipe inference overlap rather than running end to end.
+    cam.start_grabber()
     if not cam.is_running:
         print("[FAIL] Camera did not open.  Try:  npm run cameras")
         return 1
@@ -194,11 +242,14 @@ def main() -> int:
     last = None
     paused = False
     frame_times = deque(maxlen=30)
+    last_loop_start = None
+    stage_ms = {k: deque(maxlen=30) for k in ("read", "hands", "pose", "draw", "show")}
 
     try:
         while True:
             t_frame = time.time()
             ok, frame = cam.read()
+            t_read = time.time()
             if not ok or frame is None:
                 time.sleep(0.01)
                 continue
@@ -209,8 +260,10 @@ def main() -> int:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 rgb.flags.writeable = False
                 results = hands.process(rgb)
+                t_hands = time.time()
                 anchors = pose.update(rgb)
                 rgb.flags.writeable = True
+                t_pose = time.time()
 
                 left, right = split_hands(results)
                 hands_ok = (left is not None) or (right is not None)
@@ -248,18 +301,35 @@ def main() -> int:
                                                   mp_hands.HAND_CONNECTIONS,
                                                   spec, spec)
 
-                frame_times.append(time.time() - t_frame)
-                fps = 1.0 / max(1e-6, float(np.mean(frame_times)))
+                t_draw0 = time.time()
+
+                # The frame rate is measured from one loop top to the next, so
+                # it counts EVERYTHING - including drawing and window updates.
+                # The old counter stopped before those, which meant it reported
+                # a rate the loop never actually achieved.
+                if last_loop_start is not None:
+                    frame_times.append(t_frame - last_loop_start)
+                last_loop_start = t_frame
+                fps = (1.0 / max(1e-6, float(np.mean(frame_times)))
+                       if frame_times else 0.0)
+
+                stage_ms["read"].append((t_read - t_frame) * 1000)
+                stage_ms["hands"].append((t_hands - t_read) * 1000)
+                stage_ms["pose"].append((t_pose - t_hands) * 1000)
+                stage_ms["draw"].append((t_draw0 - t_pose) * 1000)
 
                 draw_hud(frame, hands_ok=hands_ok, body_ok=anchors.valid,
                          capturing=seg.is_capturing, captured=seg.captured_frames,
-                         last=last, history=history, fps=fps, threshold=threshold)
+                         last=last, history=history, fps=fps, threshold=threshold,
+                         stage_ms=stage_ms)
             else:
                 text(frame, "PAUSED", (12, 40), C_AMBER, 1.0, 3)
 
+            t_show0 = time.time()
             cv2.imshow("Tarjuman — live model test", frame)
 
             key = cv2.waitKey(1) & 0xFF
+            stage_ms["show"].append((time.time() - t_show0) * 1000)
             if key == ord("q"):
                 break
             if key == ord("r"):
@@ -272,6 +342,7 @@ def main() -> int:
     finally:
         hands.close()
         pose.close()
+        cam.stop_grabber()
         cam.release()
         cv2.destroyAllWindows()
 

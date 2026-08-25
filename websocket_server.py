@@ -32,6 +32,18 @@ Binary audio protocol (unchanged)
   0x02  + <bytes>  -> audio for conversational chat via STT
 """
 
+# -- Import bootstrap ---------------------------------------------------------
+# Puts src/ on the path so `tarjuman_core` resolves when this file is run
+# directly (`python websocket_server.py`). Running through `npm run ...` sets PYTHONPATH
+# instead, and `pip install -e .` makes both unnecessary - this is the belt to
+# those braces, so a plain `python` invocation never fails with ImportError.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "src")
+    if _os.path.basename(_os.path.dirname(_os.path.abspath(__file__))) == "scripts"
+    else _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "src"))
+
 import asyncio
 import collections
 import json
@@ -54,13 +66,14 @@ import websockets
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
-from camera_manager import (
+from tarjuman_core.paths import data, root
+from tarjuman_core.camera_manager import (
     SmartCamera, choose_camera_interactive, describe_cameras, droidcam_url,
 )
-from dtw_matcher import SignReferenceLibrary
-from pose_to_bones import frame_to_bone_dirs
-from gesture_segmenter import GestureSegmenter
-from feature_extractor import (
+from tarjuman_core.dtw_matcher import SignReferenceLibrary
+from tarjuman_core.pose_to_bones import frame_to_bone_dirs
+from tarjuman_core.gesture_segmenter import GestureSegmenter
+from tarjuman_core.feature_extractor import (
     SEQUENCE_LENGTH,
     TOTAL_FEATURES,
     VALS_PER_FRAME,
@@ -187,8 +200,8 @@ LABEL_TO_ARABIC = {
 #  ONNX model + label map loading
 # -----------------------------------------------------------------------------
 
-ONNX_MODEL_PATH = "sign_model.onnx"
-LABELS_JSON     = "labels.json"
+ONNX_MODEL_PATH = root("sign_model.onnx")
+LABELS_JSON     = data("labels.json")
 
 # Graceful loading: if the model files have not been trained yet, the server
 # still starts — camera, TTS, and STT will work; only sign recognition will
@@ -359,9 +372,15 @@ except Exception as exc:
 # Built from the same CSV the classifier trains on, so practice mode works
 # without recording a separate reference set. Adding a new word to the
 # dictionary needs only one new recording — no retraining.
-REFERENCE_CSV = "dynamic_gestures_v4.csv"
+REFERENCE_CSV = data("dynamic_gestures_v4.csv")
 dtw_library = SignReferenceLibrary.from_csv(REFERENCE_CSV)
 
+
+# Fail here rather than inside a client session. Hands() is constructed
+# per-connection below, so a dependency mismatch would otherwise surface as a
+# handler exception on the first client instead of at server startup.
+from tarjuman_core.runtime_check import check_mediapipe_stack
+check_mediapipe_stack()
 
 # MediaPipe module reference (instances created per-session to avoid races).
 # Hands ONLY — Holistic additionally ran BlazePose (33 pts) and Face Mesh
@@ -913,6 +932,10 @@ async def camera_loop(ws, session: ClientSession) -> None:
     loop = asyncio.get_event_loop()
 
     cam.start()
+    # Decode frames in the background. read() then returns the NEWEST frame
+    # instead of blocking until the sensor produces one, so capture and
+    # MediaPipe inference overlap rather than running end to end.
+    cam.start_grabber()
 
     if not cam.is_running:
         _camera_owner = None
@@ -980,6 +1003,7 @@ async def camera_loop(ws, session: ClientSession) -> None:
 
     finally:
         # Guaranteed cleanup regardless of exit reason
+        cam.stop_grabber()
         cam.release()
         if _camera_owner is session:
             _camera_owner = None      # free the device for the next client

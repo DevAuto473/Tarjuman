@@ -14,6 +14,18 @@ index, and can show a live preview so the right one is chosen by eye.
     npm run cameras
 """
 
+# -- Import bootstrap ---------------------------------------------------------
+# Puts src/ on the path so `tarjuman_core` resolves when this file is run
+# directly (`python list_cameras.py`). Running through `npm run ...` sets PYTHONPATH
+# instead, and `pip install -e .` makes both unnecessary - this is the belt to
+# those braces, so a plain `python` invocation never fails with ImportError.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "src")
+    if _os.path.basename(_os.path.dirname(_os.path.abspath(__file__))) == "scripts"
+    else _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "src"))
+
 import argparse
 import os
 import platform
@@ -49,7 +61,7 @@ def device_names() -> list[str]:
     """
     # Shared with the pickers in camera_manager, so the name you choose from in
     # this tool is the same name they show you.
-    from camera_manager import camera_device_names
+    from tarjuman_core.camera_manager import camera_device_names
     names, _exact = camera_device_names()
     return names
 

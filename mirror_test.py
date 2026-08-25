@@ -25,6 +25,18 @@ and the feedback loop is a frame instead of a rebuild.
 Controls:  q = quit   ·   m = mirror the figure   ·   s = save a frame
 """
 
+# -- Import bootstrap ---------------------------------------------------------
+# Puts src/ on the path so `tarjuman_core` resolves when this file is run
+# directly (`python mirror_test.py`). Running through `npm run ...` sets PYTHONPATH
+# instead, and `pip install -e .` makes both unnecessary - this is the belt to
+# those braces, so a plain `python` invocation never fails with ImportError.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "src")
+    if _os.path.basename(_os.path.dirname(_os.path.abspath(__file__))) == "scripts"
+    else _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "src"))
+
 import os
 import sys
 import time
@@ -33,12 +45,12 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-from camera_manager import SmartCamera, choose_camera_interactive
-from pose_to_bones import (
+from tarjuman_core.camera_manager import SmartCamera, choose_camera_interactive
+from tarjuman_core.pose_to_bones import (
     ARM_SPAN, FINGER_CHAINS, LOWER_FRAC, TORSO_HALF_D, TORSO_HALF_W, UPPER_FRAC,
     arm_directions, finger_directions, hand_centre, hand_points,
 )
-from feature_extractor import (
+from tarjuman_core.feature_extractor import (
     PoseTracker, VALS_PER_HAND, extract_frame_features, prepare_frame,
     split_hands,
 )
@@ -215,6 +227,10 @@ def main() -> int:
 
     cam = SmartCamera(source=choose_camera_interactive())
     cam.start()
+    # Decode frames in the background. read() then returns the NEWEST frame
+    # instead of blocking until the sensor produces one, so capture and
+    # MediaPipe inference overlap rather than running end to end.
+    cam.start_grabber()
     if not cam.is_running:
         print("[FAIL] Camera did not open.  Try:  npm run cameras")
         return 1
@@ -323,6 +339,7 @@ def main() -> int:
     finally:
         hands.close()
         pose.close()
+        cam.stop_grabber()
         cam.release()
         cv2.destroyAllWindows()
 

@@ -17,6 +17,18 @@ Pipeline overview
   7. Export: sign_model.onnx  +  labels.json
 """
 
+# -- Import bootstrap ---------------------------------------------------------
+# Puts src/ on the path so `tarjuman_core` resolves when this file is run
+# directly (`python train_model.py`). Running through `npm run ...` sets PYTHONPATH
+# instead, and `pip install -e .` makes both unnecessary - this is the belt to
+# those braces, so a plain `python` invocation never fails with ImportError.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "src")
+    if _os.path.basename(_os.path.dirname(_os.path.abspath(__file__))) == "scripts"
+    else _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "src"))
+
 import json
 import os
 import sys
@@ -30,11 +42,14 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import (
+    StratifiedKFold, cross_val_predict, train_test_split,
+)
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
-from onnx_export import export_pipeline
+from tarjuman_core.paths import data, root
+from tarjuman_core.onnx_export import export_pipeline
 
 
 
@@ -43,11 +58,17 @@ from onnx_export import export_pipeline
 #  Configuration
 # -----------------------------------------------------------------------------
 
-INPUT_CSV       = os.environ.get("TARJUMAN_CSV", "dynamic_gestures_v4.csv")
-PKL_MODEL_PATH  = "sign_model.pkl"     # dev / inspection only
-ONNX_MODEL_PATH = "sign_model.onnx"    # production artifact used by the server
-LABELS_JSON     = "labels.json"
-CM_IMAGE        = "confusion_matrix.png"
+INPUT_CSV       = os.environ.get("TARJUMAN_CSV", data("dynamic_gestures_v4.csv"))
+PKL_MODEL_PATH  = root("sign_model.pkl")     # dev / inspection only
+ONNX_MODEL_PATH = root("sign_model.onnx")    # production artifact used by the server
+LABELS_JSON     = data("labels.json")
+CM_IMAGE        = root("confusion_matrix.png")
+
+# Cross-validation folds. Five is the usual compromise: each fold trains on 80%
+# of the data, and every sample is tested exactly once across the five rounds.
+# Set TARJUMAN_SKIP_CV=1 to skip it once the vocabulary is large enough that
+# five extra trainings start to hurt.
+CV_FOLDS = 5
 
 # Model hyper-parameters
 N_ESTIMATORS = 150
@@ -66,7 +87,7 @@ TIME_WARP_FACTORS = (0.7, 1.4)   # 30 % faster … 40 % slower
 FRAME_DROPOUT_P   = 0.10         # probability a frame is dropped, then re-filled
 
 # Data geometry — imported, never redeclared (see feature_extractor.py)
-from feature_extractor import (
+from tarjuman_core.feature_extractor import (
     FRAME_FEATURES, N_GLOBAL_FEATURES, SEQUENCE_LENGTH, TOTAL_FEATURES, VALS_PER_FRAME,
 )
 
@@ -275,7 +296,6 @@ def save_confusion_matrix(y_true, y_pred, class_names, path: str):
 
     fig.savefig(path, dpi=180)
     plt.close(fig)
-    print(f"   [OK] confusion matrix saved -> {path}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -320,6 +340,92 @@ def _write_bytes(path: str, data: bytes) -> None:
         print("       then run `npm run train` again.")
         print("       Your previous model was left untouched.")
         sys.exit(1)
+
+
+def cross_validate_all(pipeline, X, y, class_names):
+    """
+    Test on EVERY sample, not just the 20% held out once.
+
+    Why this matters more than it sounds
+    ------------------------------------
+    A single 80/20 split of 30 recordings tests six of them. Six. A perfect
+    score on six samples is compatible with a genuinely accurate model AND with
+    a mediocre one that got lucky - the exact binomial bound says all you may
+    claim is "better than 54%". Most of the evidence you spent time recording is
+    never used for measurement at all.
+
+    K-fold rotates the split instead: five rounds, a different fifth held out
+    each time, so every recording is predicted exactly once by a model that did
+    not see it. Same data, same recording effort, five times the evidence.
+
+    The SPREAD is the second reason. One number cannot tell a stable model from
+    one that happens to score well on a lucky split; five numbers can. A mean of
+    95% reads very differently at +/-1% than at +/-12%, and only the latter
+    tells you the result is not to be trusted yet.
+
+    Returns the cross-validated predictions, or None if it could not run.
+    """
+    if os.getenv("TARJUMAN_SKIP_CV"):
+        print("\n[cv] Skipped (TARJUMAN_SKIP_CV is set)")
+        return None
+
+    counts = np.bincount(y)
+    smallest = int(counts.min())
+    folds = min(CV_FOLDS, smallest)
+    if folds < 2:
+        print(f"\n[cv] Skipped - '{class_names[int(counts.argmin())]}' has only "
+              f"{smallest} sample(s); k-fold needs at least 2 per class.")
+        return None
+    if folds < CV_FOLDS:
+        print(f"\n[cv] Using {folds} folds instead of {CV_FOLDS}: the smallest "
+              f"class has only {smallest} samples.")
+
+    print("\n" + "=" * 65)
+    print(f"   CROSS-VALIDATION  ({folds} folds, every sample tested once)")
+    print("=" * 65)
+
+    cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=RANDOM_STATE)
+
+    t0 = time.perf_counter()
+    scores = []
+    for k, (tr, te) in enumerate(cv.split(X, y), start=1):
+        import sklearn.base
+        model = sklearn.base.clone(pipeline)
+        model.fit(X[tr], y[tr])
+        acc = accuracy_score(y[te], model.predict(X[te]))
+        scores.append(acc)
+        print(f"   fold {k}/{folds}: {acc * 100:6.2f} %   ({len(te)} samples)")
+
+    scores = np.asarray(scores)
+    print(f"\n   mean     : {scores.mean() * 100:.2f} %  "
+          f"+/- {scores.std() * 100:.2f}")
+    print(f"   worst    : {scores.min() * 100:.2f} %")
+
+    # The spread is the headline, so say what it means rather than leaving the
+    # reader to interpret a standard deviation.
+    spread = scores.std() * 100
+    if spread < 2:
+        print("   -> Consistent across folds. The number is trustworthy.")
+    elif spread < 6:
+        print("   -> Some variation between folds. Usable, but more samples")
+        print("      per word would tighten it.")
+    else:
+        print("   -> UNSTABLE: folds disagree a lot, so the mean is not")
+        print("      meaningful yet. Record more samples per word before")
+        print("      drawing any conclusion from this figure.")
+
+    # Every sample predicted by a model that never saw it.
+    y_cv = cross_val_predict(pipeline, X, y, cv=cv)
+    print(f"\n   Per-word recall over all {len(y)} samples:")
+    for i, name in enumerate(class_names):
+        mask = y == i
+        n = int(mask.sum())
+        hit = int((y_cv[mask] == i).sum())
+        bar = "#" * int(round(hit / n * 20)) if n else ""
+        print(f"     {name:<14s} {hit:>4d}/{n:<4d}  {hit / n * 100:5.1f} %  {bar}")
+
+    print(f"\n   ({time.perf_counter() - t0:.1f}s)")
+    return y_cv
 
 
 def preflight(csv_path: str) -> None:
@@ -501,7 +607,7 @@ def main():
     # b) Temporal: speed warping — the SAME sign performed faster / slower.
     #    Signs whose meaning IS their tempo are warped only gently.
     try:
-        from vocabulary import as_dicts
+        from tarjuman_core.vocabulary import as_dicts
         speed_ids = {e["id"] for e in as_dicts() if e["speed_critical"]}
     except Exception:
         speed_ids = set()
@@ -555,21 +661,23 @@ def main():
         zero_division=0,
     ))
 
-    # Confusion matrix -> PNG
-    # A picture is a nicety; the model is the point. Losing the run because a
-    # plotting backend misbehaved would be an absurd trade.
-    try:
-        save_confusion_matrix(y_test, y_pred, class_names, CM_IMAGE)
-    except Exception as exc:
-        print(f"   [!] Confusion matrix skipped ({type(exc).__name__}: {exc})")
-        print("       Training continues - this affects no output the app uses.")
+    # The confusion matrix and the confusable-pair report are produced from
+    # the CROSS-VALIDATED predictions below instead, which cover every sample.
 
-    # -- Which pairs actually get confused? ----------------------------------
-    # A single accuracy number hides the thing that matters most here: WHICH
-    # signs the model mixes up. With a vocabulary full of near-identical
-    # gestures, the confusable pairs are the whole story — they tell you which
-    # signs need redesigning or more samples, instead of guessing.
-    report_confusions(y_test, y_pred, class_names)
+    # -- Cross-validation: measure using EVERY sample -----------------------
+    cv_pred = cross_validate_all(pipeline, features, y, class_names)
+    if cv_pred is not None:
+        # The saved picture uses the cross-validated predictions, because they
+        # cover the whole dataset. A confusion matrix built from a 20% holdout
+        # of 30 recordings has six cells' worth of evidence per word, which is
+        # not enough to see a confusion that happens one time in ten.
+        try:
+            save_confusion_matrix(y, cv_pred, class_names, CM_IMAGE)
+            print(f"\n   [OK] confusion matrix saved -> {CM_IMAGE}"
+                  f"  (cross-validated, all {len(y)} samples)")
+        except Exception as exc:
+            print(f"   [!] Confusion matrix skipped ({type(exc).__name__}: {exc})")
+        report_confusions(y, cv_pred, class_names)
 
     # -- Step 7: Export ONNX (production) + PKL (dev) + labels.json ---------
     print(f"\n[#######] 7/7  Exporting ONNX + PKL + labels.json" if False else f"\n[#######] 7/7  Exporting ONNX + PKL + labels.json")

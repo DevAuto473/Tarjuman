@@ -14,16 +14,21 @@
     "collect": "node scripts/run-python.mjs data_collector.py",
     "train": "node scripts/run-python.mjs train_model.py",
     "test": "node scripts/run-python.mjs test_model.py",
-    "migrate": "node scripts/run-python.mjs migrate_dataset.py",
-    "cameras": "node scripts/run-python.mjs list_cameras.py",
-    "sheet": "node scripts/run-python.mjs make_learn_sheet.py",
-    "check": "node scripts/run-python.mjs vocabulary.py",
+    "migrate": "node scripts/run-python.mjs scripts/migrate_dataset.py",
+    "cameras": "node scripts/run-python.mjs scripts/list_cameras.py",
+    "sheet": "node scripts/run-python.mjs scripts/make_learn_sheet.py",
+    "check": "node scripts/run-python.mjs src/tarjuman_core/vocabulary.py",
     "export3d": "node scripts/run-python.mjs export_signs_3d.py",
     "mirror": "node scripts/run-python.mjs mirror_test.py",
-    "doctor": "node scripts/run-python.mjs diagnose.py"
+    "doctor": "node scripts/run-python.mjs scripts/diagnose.py",
+    "fix": "node scripts/run-python.mjs scripts/fix_env.py",
+    "bench": "node scripts/run-python.mjs scripts/bench_pipeline.py"
   },
   "devDependencies": {
     "concurrently": "^10.0.0",
     "wait-on": "^9.0.10"
-  }
+  },
+  "workspaces": [
+    "tarjuman"
+  ]
 }

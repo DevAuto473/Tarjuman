@@ -26,3 +26,14 @@ confusion_matrix.png
 Thumbs.db
 .vscode/
 .idea/
+
+# -- Restructured layout ------------------------------------------------------
+# Datasets moved to data/. The recordings are large and machine-specific, so
+# they stay out of git; the sheet and label map are small and useful to track.
+data/*.csv
+!data/learn.csv
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/

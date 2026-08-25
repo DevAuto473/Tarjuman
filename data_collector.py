@@ -23,6 +23,18 @@ Controls
   q   ->  Quit and save any buffered sequences
 """
 
+# -- Import bootstrap ---------------------------------------------------------
+# Puts src/ on the path so `tarjuman_core` resolves when this file is run
+# directly (`python data_collector.py`). Running through `npm run ...` sets PYTHONPATH
+# instead, and `pip install -e .` makes both unnecessary - this is the belt to
+# those braces, so a plain `python` invocation never fails with ImportError.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "src")
+    if _os.path.basename(_os.path.dirname(_os.path.abspath(__file__))) == "scripts"
+    else _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "src"))
+
 import csv
 import os
 import sys
@@ -33,12 +45,13 @@ import mediapipe as mp
 import numpy as np
 
 # Import our smart camera abstraction (works on laptop and Raspberry Pi)
-from camera_manager import (
+from tarjuman_core.paths import data
+from tarjuman_core.camera_manager import (
     DROIDCAM_IP, DROIDCAM_PORT, SmartCamera, choose_camera_interactive, droidcam_url, list_local_cameras,
 )
 
 # Feature geometry + extraction — single source of truth shared with the server
-from feature_extractor import (
+from tarjuman_core.feature_extractor import (
     GLOBAL_FEATURE_NAMES,
     N_GLOBAL_FEATURES,
     SEQUENCE_LENGTH,
@@ -50,14 +63,14 @@ from feature_extractor import (
     prepare_frame,
     split_hands,
 )
-from gesture_segmenter import resample_sequence
+from tarjuman_core.gesture_segmenter import resample_sequence
 
 
 # -----------------------------------------------------------------------------
 #  Configuration
 # -----------------------------------------------------------------------------
 
-OUTPUT_CSV = "dynamic_gestures_v4.csv"   # v4 = body-anchored features
+OUTPUT_CSV = data("dynamic_gestures_v4.csv")   # v4 = body-anchored features
 
 # Samples per label before a class is considered "done".
 # 30+ per class is the realistic floor for a 100-class problem; below that the
@@ -70,6 +83,12 @@ TARGET_PER_LABEL = 30
 # -----------------------------------------------------------------------------
 # Hands ONLY. Holistic additionally ran BlazePose (33 pts) and Face Mesh
 # (468 pts) every frame — the face landmarks were never used at all.
+
+# Hands is constructed at import time here, so the compatibility check has to
+# come first - otherwise a protobuf mismatch surfaces as a traceback from
+# inside MediaPipe before any of this file's own output appears.
+from tarjuman_core.runtime_check import check_mediapipe_stack
+check_mediapipe_stack()
 
 mp_hands     = mp.solutions.hands
 mp_drawing   = mp.solutions.drawing_utils
@@ -281,7 +300,7 @@ def _existing_counts(filepath: str) -> dict:
 def _choose_label() -> str:
     """Interactive picker over vocabulary.py, with per-label progress."""
     try:
-        from vocabulary import as_dicts
+        from tarjuman_core.vocabulary import as_dicts
         vocab = as_dicts()
     except Exception as exc:
         print(f"[!]  vocabulary.py unavailable ({exc}) — falling back to free text.")
@@ -333,6 +352,51 @@ def main() -> None:
     # you have picked a label and mentally prepared to sign.
     camera_source = _choose_camera()
 
+    # -- Ensure CSV exists with the correct header ----------------------------
+    _ensure_csv_header(OUTPUT_CSV)
+
+    # -- Camera and models open ONCE, for the whole session -------------------
+    # Opening a webcam and loading the MediaPipe graphs takes several seconds.
+    # Doing that per word made recording a vocabulary of a hundred signs a
+    # hundred separate startups; keeping them alive across words turns the
+    # session into one continuous flow.
+    pose_tracker = get_pose_tracker()
+    cam = SmartCamera(source=camera_source)
+    cam.start()
+    # Decode frames in the background. read() then returns the NEWEST frame
+    # instead of blocking until the sensor produces one, so capture and
+    # MediaPipe inference overlap rather than running end to end.
+    cam.start_grabber()
+
+    if not cam.is_running:
+        print("[FAIL] Camera did not open. See the checklist above. Exiting.")
+        sys.exit(1)
+
+    print(f"[Collector] Camera backend: {cam.backend}")
+
+    session_totals = {}
+    try:
+        while True:
+            label = _record_one_word(cam, pose_tracker, session_totals)
+            if label is None:
+                break
+    finally:
+        hands.close()
+        pose_tracker.close()
+        cam.stop_grabber()
+        cam.release()
+        cv2.destroyAllWindows()
+        _print_session_summary(session_totals)
+
+
+def _record_one_word(cam, pose_tracker, session_totals):
+    """
+    Record one label end to end.
+
+    Returns a truthy value if the user wants another word, or None to finish.
+    The camera and MediaPipe graphs are owned by the caller and are NOT torn
+    down here - that is the whole point of splitting this out.
+    """
     # -- Pick the label from the official vocabulary -------------------------
     # Typing labels freehand is how a dataset ends up with "test1", "test_1"
     # and "test 2" as three separate classes. Choosing from the list keeps the
@@ -387,9 +451,6 @@ def main() -> None:
         print("   Reposition, change distance, or swap signer between takes.")
     print("   Press 'q' to quit early.\n")
 
-    # -- Ensure CSV exists with the correct header ----------------------------
-    _ensure_csv_header(OUTPUT_CSV)
-
     # -- State variables ------------------------------------------------------
     is_recording     = False
     current_sequence = []       # Accumulates frame landmark arrays
@@ -397,16 +458,6 @@ def main() -> None:
     sequences_saved  = 0
     next_auto_start_time = float('inf')
 
-    # -- Camera + main loop ---------------------------------------------------
-    pose_tracker = get_pose_tracker()
-    cam = SmartCamera(source=camera_source)
-    cam.start()
-
-    if not cam.is_running:
-        print("[FAIL] Camera did not open. See the checklist above. Exiting.")
-        sys.exit(1)
-
-    print(f"[Collector] Camera backend: {cam.backend}")
     print("[Collector] Camera window open. Follow the on-screen instructions.\n")
 
     try:
@@ -492,20 +543,71 @@ def main() -> None:
                 break
 
     finally:
-        # -- Graceful teardown ------------------------------------------------
-        hands.close()
-        pose_tracker.close()
-        cam.release()
+        # The camera and the MediaPipe graphs deliberately stay open here -
+        # they belong to the session, not to this word. Only the preview
+        # window is closed, because an OpenCV window left up while the
+        # terminal waits for input stops redrawing and Windows paints it as
+        # "Not Responding".
         cv2.destroyAllWindows()
 
-        print(f"\n Session summary for '{label}':")
-        print(f"   Sequences recorded : {sequences_saved}")
-        print(f"   Output file        : {os.path.abspath(OUTPUT_CSV)}")
+    session_totals[label] = session_totals.get(label, 0) + sequences_saved
 
-        if sequences_saved > 0:
-            print("[OK] Data saved successfully.")
-        else:
-            print("[!]  No sequences were saved in this session.")
+    print(f"\n Finished '{label}':")
+    print(f"   Sequences recorded : {sequences_saved}")
+    print(f"   Output file        : {os.path.abspath(OUTPUT_CSV)}")
+    if sequences_saved > 0:
+        print("[OK] Data saved successfully.")
+    else:
+        print("[!]  No sequences were saved for this word.")
+
+    return _ask_next()
+
+
+def _ask_next():
+    """
+    Offer another word, or finish.
+
+    Returns a truthy value to continue the session, or None to stop. Recording
+    a vocabulary means dozens of words in a sitting, and quitting to the shell
+    after each one meant re-picking the camera and reloading MediaPipe every
+    time - several seconds of waiting for no reason.
+    """
+    print("\n" + "=" * 60)
+    print("  What next?")
+    print("=" * 60)
+    print("  1. Finish and close")
+    print("  2. Record another word  (camera stays open)")
+    print()
+
+    while True:
+        try:
+            choice = input("Choice [1-2, default 2]: ").strip() or "2"
+        except (EOFError, KeyboardInterrupt):
+            print("\n[stop] Finishing.")
+            return None
+        if choice == "1":
+            return None
+        if choice == "2":
+            print()
+            return "continue"
+        print("  [!] Enter 1 or 2.")
+
+
+def _print_session_summary(session_totals):
+    """Everything recorded across the whole sitting, not just the last word."""
+    print("\n" + "=" * 60)
+    print("  SESSION SUMMARY")
+    print("=" * 60)
+    if not session_totals:
+        print("  Nothing was recorded.")
+        return
+    total = 0
+    for word, n in session_totals.items():
+        print(f"   {word:<20s} {n:>4d} sequences")
+        total += n
+    print("   " + "-" * 30)
+    print(f"   {'TOTAL':<20s} {total:>4d} sequences")
+    print(f"\n   Next:  npm run train")
 
 
 if __name__ == "__main__":

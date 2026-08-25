@@ -31,6 +31,18 @@ Usage
     python migrate_dataset.py --input other.csv --output other_v2.csv
 """
 
+# -- Import bootstrap ---------------------------------------------------------
+# Puts src/ on the path so `tarjuman_core` resolves when this file is run
+# directly (`python migrate_dataset.py`). Running through `npm run ...` sets PYTHONPATH
+# instead, and `pip install -e .` makes both unnecessary - this is the belt to
+# those braces, so a plain `python` invocation never fails with ImportError.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "src")
+    if _os.path.basename(_os.path.dirname(_os.path.abspath(__file__))) == "scripts"
+    else _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "src"))
+
 import argparse
 import csv
 import os
@@ -38,7 +50,8 @@ import sys
 
 import numpy as np
 
-from feature_extractor import (
+from tarjuman_core.paths import data
+from tarjuman_core.feature_extractor import (
     N_HAND_LANDMARKS,
     SEQUENCE_LENGTH,
     TOTAL_FEATURES,
@@ -59,8 +72,8 @@ OLD_HAND_VALS       = N_HAND_LANDMARKS * OLD_COORDS_PER_LM        # 84
 OLD_VALS_PER_FRAME  = OLD_POSE_VALS + OLD_HAND_VALS * 2           # 300
 OLD_TOTAL_FEATURES  = OLD_VALS_PER_FRAME * SEQUENCE_LENGTH        # 9 000
 
-DEFAULT_INPUT  = "dynamic_gestures.csv"
-DEFAULT_OUTPUT = "dynamic_gestures_v2.csv"
+DEFAULT_INPUT  = data("dynamic_gestures.csv")
+DEFAULT_OUTPUT = data("dynamic_gestures_v2.csv")
 
 
 # -----------------------------------------------------------------------------

@@ -39,7 +39,7 @@ CUMULATIVE = [
     ("sklearn", "import sklearn.ensemble, sklearn.pipeline, sklearn.preprocessing"),
     ("skl2onnx", "from skl2onnx import convert_sklearn"),
     ("cv2", "import cv2"),
-    ("feature_extractor", "import feature_extractor"),
+    ("feature_extractor", "from tarjuman_core import feature_extractor"),
 ]
 
 # Individually, to tell "this package is broken" apart from "these two clash".
