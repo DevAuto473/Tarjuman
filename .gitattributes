@@ -1,0 +1,41 @@
+# Line-ending policy — Tarjuman runs on Windows, Linux and a Raspberry Pi
+# =============================================================================
+# Without this file git kept reporting four files as "modified" immediately
+# after a clean commit. The diff was 3398 insertions and 3398 deletions — the
+# same count on both sides, with identical content. That is the signature of
+# line-ending churn, not of a real change: Windows checks files out as CRLF,
+# and every other machine then sees every line as rewritten.
+#
+# Left alone this gets worse, not better, once three machines share the repo:
+# a laptop, a second PC and the Pi would each "modify" the dataset simply by
+# checking it out, and the resulting conflict would be in a 4213-column CSV
+# that nobody can resolve by hand.
+
+# Normalise text to LF in the repository. Working copies still get native
+# endings, so nothing changes for editors on Windows.
+* text=auto eol=lf
+
+# Datasets: never touched, never auto-merged.
+#
+# -text switches off end-of-line conversion entirely, which stops the churn at
+# its source. It also makes git refuse to auto-merge these files, and that is
+# deliberate: two machines recording samples in parallel produce appends that
+# git would happily interleave into a silently corrupt dataset. A conflict you
+# must resolve on purpose is far safer than a merge you never noticed.
+*.csv -text
+data/labels.json -text
+
+# Generated artefacts — same reasoning, different origin. These are rebuilt by
+# `npm run train` / `npm run export3d`, so a merge is never the right answer.
+tarjuman/public/trained_signs.json -text
+
+# Genuinely binary: mark them so git never inspects or converts them.
+*.onnx  binary
+*.pkl   binary
+*.glb   binary
+*.gif   binary
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.mp3   binary
+*.pdf   binary
