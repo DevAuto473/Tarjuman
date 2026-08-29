@@ -187,6 +187,38 @@ TARJUMAN_NO_PROMPT=1      # تخطّي كل أسئلة الكاميرا
 
 ---
 
+## تشغيل المشروع على جهاز جديد
+
+```bash
+git clone https://github.com/DevAuto473/Tarjuman.git
+cd Tarjuman
+
+python -m venv venv                  # على الراسبيري: أضف --system-site-packages
+venv\Scripts\activate                # لينكس/ماك:  source venv/bin/activate
+pip install -r requirements.txt
+
+npm install
+cp .env.example .env                 # ويندوز: copy .env.example .env
+npm run test
+```
+
+**ما ينتقل عبر git:** الكود · `data/dynamic_gestures_v4.csv` · `data/labels.json` · `sign_model.onnx`
+
+فتستطيع التدريب والتشغيل مباشرةً بلا نقل يدوي.
+
+**ما لا ينتقل — ولماذا:**
+
+| الملف | السبب | ماذا تفعل |
+|---|---|---|
+| `.env` | **يحوي مفاتيح API** | انسخه يدوياً (فلاش/مدير كلمات مرور) — **لا ترفعه أبداً** |
+| `venv/` · `node_modules/` | خاصّة بنظام التشغيل والمعمارية | `pip install` و `npm install` |
+| `sign_model.pkl` | pickle هشّ بين النسخ، ويُولَّد من التدريب | `npm run train` |
+| النسخ الاحتياطية `*.before-*.csv` | كبيرة ولا يقرأها أي كود | تبقى محلّية |
+
+> 🔑 **قاعدة لا تُكسَر:** المفاتيح تُنقَل بيدك، لا عبر git. ملف `.env` مرفوع مرة واحدة على مستودع عام يعني مفاتيح محروقة — وحذفه لاحقاً **لا يمحوه** من سجلّ git.
+
+---
+
 ## بنية المشروع
 
 ```

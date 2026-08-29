@@ -310,6 +310,17 @@ class SmartCamera:
     MANUAL_EXPOSURE = float(_manual_exposure_raw) if _manual_exposure_raw else None
     MANUAL_GAIN     = float(_manual_gain_raw) if _manual_gain_raw else None
 
+    # Mean luma (0-255) below which a frame is considered too dark to use.
+    # 45 was far too permissive - 45/255 is about 18% grey, a picture you can
+    # barely see. Brightness is a HARD constraint: a fast black frame is worth
+    # nothing to a landmark detector.
+    BRIGHTNESS_MIN = float(os.getenv("CAMERA_BRIGHTNESS_MIN", "85"))
+
+    # Set CAMERA_FORCE_FPS=0 to switch the whole exposure-forcing search off
+    # and simply leave the camera on auto-exposure.
+    FORCE_FPS = os.getenv("CAMERA_FORCE_FPS", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
     # -- Backend identifiers --------------------------------------------------
     BACKEND_PICAMERA2 = "picamera2"
     BACKEND_OPENCV    = "opencv"
@@ -531,6 +542,33 @@ class SmartCamera:
             return 0.0
         return float(np.mean(frame))
 
+    def _enable_auto_exposure(self, cap) -> None:
+        """
+        Hand exposure control back to the camera.
+
+        This matters far more than it looks. UVC webcams keep manual exposure
+        settings in the DEVICE, not the process - so a short exposure written
+        by a previous run is still in force the next time the camera is
+        opened, and every run after that, until something sets it back or the
+        camera is physically unplugged.
+
+        That is what turned the picture black in a brightly lit room: an
+        earlier run had switched auto-exposure off and pinned a very short
+        exposure. The next run then measured a healthy 30 fps, concluded
+        there was nothing to fix, and returned early - leaving the dark
+        setting exactly where it was. Starting from a known state removes a
+        whole class of "it was fine yesterday" faults.
+
+        Auto values are backend-specific: 0.75 on DirectShow, 3 on V4L2.
+        """
+        for value in (0.75, 3):
+            try:
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, value)
+            except Exception:
+                pass
+        for _ in range(6):          # let the AE loop converge
+            cap.read()
+
     def _disable_auto_exposure(self, cap) -> bool:
         """
         Turn off auto-exposure, regardless of which backend is behind `cap`.
@@ -592,6 +630,48 @@ class SmartCamera:
 
         return applied
 
+    def _brighten_without_exposure(self, cap, bright: float) -> float:
+        """
+        Brighten the image using every control EXCEPT exposure time.
+
+        Exposure is the one knob that costs frame rate, because a frame can
+        never be produced faster than it is exposed - 1/32 s is a hard 32 fps
+        ceiling no matter what else is configured. Everything else here is
+        free in time terms.
+
+        Tried in order of how little damage they do:
+          GAIN       - analogue amplification. Costs noise. Best option, but
+                       plenty of laptop webcams do not expose it at all.
+          BRIGHTNESS - a digital offset. Lifts shadows, flattens contrast.
+          GAMMA      - non-linear lift. Brightens midtones, keeps highlights.
+
+        Each is applied cumulatively and re-measured, because whether any of
+        them does anything at all is entirely up to the driver, and a set()
+        that returns True is not a promise that the picture changed.
+        """
+        ladders = (
+            (cv2.CAP_PROP_GAIN, "gain", (64, 128, 192, 255)),
+            (cv2.CAP_PROP_BRIGHTNESS, "brightness", (128, 160, 192, 224)),
+            (cv2.CAP_PROP_GAMMA, "gamma", (100, 140, 180)),
+        )
+        for prop, label, steps in ladders:
+            if bright >= self.BRIGHTNESS_MIN:
+                return bright
+            for value in steps:
+                try:
+                    if not cap.set(prop, float(value)):
+                        break
+                except Exception:
+                    break
+                new_bright = self._frame_brightness(cap)
+                if new_bright > bright + 1.0:
+                    bright = new_bright
+                    if bright >= self.BRIGHTNESS_MIN:
+                        print(f"[SmartCamera] {label}={value} lifted the image "
+                              f"to {bright:.0f}/255 without touching exposure")
+                        return bright
+        return bright
+
     def _force_frame_rate(self, cap, target_rate: float) -> dict:
         """
         Stop the camera halving its own frame rate in dim light.
@@ -613,6 +693,16 @@ class SmartCamera:
         usable wins; if none does, the original settings are restored rather
         than leaving you with a fast, black picture.
         """
+        # Always start from a known state. See _enable_auto_exposure: the
+        # camera REMEMBERS a manual exposure across runs, so without this the
+        # function can inherit a dark frame from a previous session, measure a
+        # fine frame rate, and "correctly" decide to change nothing.
+        if not self.FORCE_FPS:
+            self._enable_auto_exposure(cap)
+            return {"changed": False, "rate": self._measure_rate(cap, 0.3),
+                    "brightness": self._frame_brightness(cap)}
+
+        self._enable_auto_exposure(cap)
         before_rate = self._measure_rate(cap, seconds=0.5)
         before_bright = self._frame_brightness(cap)
 
@@ -667,21 +757,34 @@ class SmartCamera:
                         pass
                 rate = self._measure_rate(cap, seconds=0.45)
                 bright = self._frame_brightness(cap)
-                if rate >= target_rate * 0.85 and bright >= 45:
+
+                # Too dark? Raise GAIN, not exposure. Gain brightens the image
+                # without lengthening the shutter, so it costs neither frame
+                # rate nor motion sharpness - it costs noise, which is the
+                # cheaper price of the two for landmark detection.
+                if bright < self.BRIGHTNESS_MIN and self.MANUAL_GAIN is None:
+                    bright = self._brighten_without_exposure(cap, bright)
+                    if bright >= self.BRIGHTNESS_MIN:
+                        rate = self._measure_rate(cap, seconds=0.3)
+
+                if rate >= target_rate * 0.85 and bright >= self.BRIGHTNESS_MIN:
                     print(f"[SmartCamera] exposure fixed at {exposure} "
                           f"(auto off) -> {rate:.0f} fps, brightness "
                           f"{bright:.0f}/255  [was {before_rate:.0f} fps]")
                     return {"changed": True, "rate": rate,
                             "brightness": bright, "exposure": exposure}
 
-        # Nothing worked: put it back exactly as it was.
+        # Nothing acceptable. Hand control back to the camera's own exposure
+        # loop rather than restoring prev_auto/prev_exp: those may themselves
+        # be a stale manual setting left behind by an earlier run, which is
+        # the exact bug that produced a black picture in a well-lit room. A
+        # usable image at a lower frame rate beats a fast unusable one.
         try:
-            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, prev_auto)
-            cap.set(cv2.CAP_PROP_EXPOSURE, prev_exp)
             if prev_gain is not None:
                 cap.set(cv2.CAP_PROP_GAIN, prev_gain)
         except Exception:
             pass
+        self._enable_auto_exposure(cap)
         rate = self._measure_rate(cap, seconds=0.3)
         print(f"[SmartCamera] [!] Sensor is running at {before_rate:.0f} fps, "
               f"not {target_rate:.0f}.")
@@ -825,6 +928,125 @@ class SmartCamera:
 
     # -- Picamera2 Backend ---------------------------------------------------
 
+    def _pick_sensor_mode(self, picam):
+        """
+        Pick the sensor mode with the WIDEST field of view, not the fastest.
+
+        This exists because of a trap that costs a whole dataset. Camera
+        Module 3 advertises, among others:
+
+            1536x864   120 fps   crop (768,432)/3072x1728   <- CROPPED
+            2304x1296   56 fps   crop (0,0)/4608x2592       <- full sensor
+
+        The fast mode is fast precisely BECAUSE it reads a smaller patch of
+        the sensor - roughly two thirds of the width. That is a narrower lens
+        in everything but name. Ask Picamera2 for a small main size and it
+        will happily pick that cropped mode, because it is only trying to
+        satisfy the pixel count you asked for.
+
+        For sign language that is the wrong trade in both directions. Hands
+        travel far off-centre, so horizontal field of view is the thing you
+        cannot afford to lose - while the frame rate is never the limit
+        anyway, because MediaPipe on a Pi CPU is far slower than 56 fps.
+
+        So: prefer the largest sensor crop area, and among equally wide modes
+        take the cheapest one that still clears the target rate.
+
+        CAMERA_SENSOR_MODE=WxH in .env overrides all of this.
+        """
+        try:
+            modes = list(getattr(picam, "sensor_modes", []) or [])
+        except Exception:
+            return None
+        if not modes:
+            return None
+
+        forced = os.getenv("CAMERA_SENSOR_MODE", "").lower().strip()
+        if forced and "x" in forced:
+            try:
+                fw, fh = (int(v) for v in forced.split("x", 1))
+                for m in modes:
+                    if tuple(m.get("size", ())) == (fw, fh):
+                        print(f"[SmartCamera] sensor mode {fw}x{fh} "
+                              f"(forced by CAMERA_SENSOR_MODE)")
+                        return {"output_size": (fw, fh),
+                                "bit_depth": m.get("bit_depth", 10)}
+                print(f"[SmartCamera] [!] CAMERA_SENSOR_MODE={forced} is not a "
+                      f"mode this sensor offers; choosing automatically.")
+            except ValueError:
+                pass
+
+        def crop_area(m):
+            crop = m.get("crop_limits") or ()
+            return (crop[2] * crop[3]) if len(crop) == 4 else 0
+
+        widest = max(crop_area(m) for m in modes)
+        if widest <= 0:
+            return None
+
+        # Within 2% of the widest crop counts as "same field of view".
+        full_fov = [m for m in modes if crop_area(m) >= widest * 0.98]
+        target = float(min(self.FPS, 30))
+        fast_enough = [m for m in full_fov if float(m.get("fps", 0)) >= target]
+        pool = fast_enough or full_fov
+
+        # Cheapest of the acceptable ones: fewer pixels off the sensor is less
+        # bandwidth and less ISP work, and the ISP scales to our output anyway.
+        chosen = min(pool, key=lambda m: m.get("size", (1 << 30, 1 << 30))[0])
+        size = tuple(chosen.get("size", ()))
+        if len(size) != 2:
+            return None
+
+        narrowest = min(crop_area(m) for m in modes)
+        print(f"[SmartCamera] sensor mode {size[0]}x{size[1]} @ "
+              f"{float(chosen.get('fps', 0)):.0f} fps — full sensor "
+              f"(widest field of view)")
+        if narrowest < widest * 0.98:
+            lost = 1.0 - (narrowest / widest) ** 0.5
+            print(f"[SmartCamera]   (a faster cropped mode exists but would cut "
+                  f"~{lost * 100:.0f}% of the frame width — hands would leave "
+                  f"the shot)")
+        return {"output_size": size, "bit_depth": chosen.get("bit_depth", 10)}
+
+    def _mount_transform(self, picam):
+        """
+        Undo the sensor's physical mounting rotation, if it reports one.
+
+        libcamera exposes how the module is mounted as a Rotation property.
+        Module 3 on a Pi 5 commonly reports 180. An inverted frame does not
+        raise anything - it just makes MediaPipe much worse at finding hands,
+        which is exactly the sort of failure that gets blamed on the model
+        weeks later.
+
+        CAMERA_ROTATE_180=0 disables this; =1 forces it on.
+        """
+        override = os.getenv("CAMERA_ROTATE_180", "").strip()
+        try:
+            from libcamera import Transform  # type: ignore[import]
+        except Exception:
+            if override == "1":
+                print("[SmartCamera] [!] CAMERA_ROTATE_180=1 but libcamera's "
+                      "Transform is unavailable; frame left as-is.")
+            return None
+
+        if override in ("0", "false", "no"):
+            return None
+        if override in ("1", "true", "yes"):
+            print("[SmartCamera] rotating frame 180° (CAMERA_ROTATE_180=1)")
+            return Transform(hflip=1, vflip=1)
+
+        try:
+            rotation = int(picam.camera_properties.get("Rotation", 0))
+        except Exception:
+            return None
+
+        if rotation == 180:
+            print("[SmartCamera] sensor reports Rotation=180 — flipping frame "
+                  "upright (set CAMERA_ROTATE_180=0 if the image ends up "
+                  "upside down)")
+            return Transform(hflip=1, vflip=1)
+        return None
+
     def _start_picamera2(self) -> None:
         """
         Start the CSI-attached Raspberry Pi camera (Module 3 and friends).
@@ -867,6 +1089,37 @@ class SmartCamera:
                 controls={"FrameRate": self.FPS},
                 buffer_count=4,
             )
+
+            # Choose the sensor mode explicitly - see _pick_sensor_mode for why
+            # letting it default silently narrows the field of view.
+            sensor = self._pick_sensor_mode(picam)
+            if sensor:
+                config_kwargs["sensor"] = sensor
+                # Having just chosen the widest sensor crop, do not throw the
+                # width away again at the output stage. The IMX708 is natively
+                # 16:9, so asking for a 4:3 frame makes the ISP crop the SIDES -
+                # precisely where the hands are. Worth a warning, not a silent
+                # override, because the rest of the pipeline was built at 4:3.
+                sw, sh = sensor["output_size"]
+                want = self.WIDTH / max(1, self.HEIGHT)
+                native = sw / max(1, sh)
+                if abs(want - native) > 0.08:
+                    sug_h = int(round(self.WIDTH / native / 2) * 2)
+                    print(f"[SmartCamera] [!] output {self.WIDTH}x{self.HEIGHT} "
+                          f"({want:.2f}) does not match the sensor's "
+                          f"{native:.2f} — the sides of the frame get cropped.")
+                    print(f"[SmartCamera]     For the full width, set "
+                          f"CAMERA_HEIGHT={sug_h} in .env "
+                          f"({self.WIDTH}x{sug_h}).")
+
+            # The camera reports how it is physically mounted. Module 3 on a Pi 5
+            # commonly reports Rotation 180, and an upside-down frame is quietly
+            # destructive here: MediaPipe is trained on upright images, so hand
+            # detection degrades badly while still "working" enough to record a
+            # whole dataset before anyone notices.
+            transform = self._mount_transform(picam)
+            if transform is not None:
+                config_kwargs["transform"] = transform
 
             # queue=False is not supported by every Picamera2 version, and it
             # is a latency optimisation rather than a requirement, so losing
