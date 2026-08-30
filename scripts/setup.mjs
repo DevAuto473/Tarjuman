@@ -1,35 +1,37 @@
 /**
- * scripts/setup.mjs — one command to take a fresh clone to a working install
- * ==========================================================================
- *     npm run setup
+ * scripts/setup.mjs — scan first, then install only what is missing
+ * =================================================================
+ *     npm run setup           scan, show the plan, then fix
+ *     npm run setup -- --check    scan only, change nothing
  *
- * Why this exists
- * ---------------
- * Setting this project up on a second machine took an entire afternoon and
- * three separate failures, none of which named its own cause:
+ * Two phases, deliberately separated:
  *
- *   1. Python 3.8 was on PATH, so pip reported "no version satisfies
- *      absl-py==2.4.0" — which reads as a missing package, not a wrong
- *      interpreter. pip only ever lists versions compatible with the running
- *      Python, and never says so.
+ *   PHASE 1  reads the machine and prints exactly what is missing, wrong or
+ *            already fine. It writes nothing. You see the whole picture
+ *            before a single byte is downloaded.
  *
- *   2. requirements.txt pinned opencv-python-headless 4.9, which predates
- *      NumPy 2 and has no GUI at all. It died on `import cv2` with
- *      "_ARRAY_API not found" and would have had no window even if it loaded.
- *      The dev machine had a newer OpenCV installed by hand on top, so it
- *      worked there and nowhere else.
+ *   PHASE 2  fixes only what phase 1 flagged. An existing venv is reused, a
+ *            satisfied requirements.txt is skipped, node_modules is left
+ *            alone if present, and .env is NEVER overwritten.
  *
- *   3. A pip upgrade had pulled in protobuf 7, which removed two APIs
- *      MediaPipe calls. `import mediapipe` still succeeded; it only failed
- *      later, when a camera actually started.
+ * Why it verifies by BUILDING things
+ * ----------------------------------
+ * Setting this project up on a second machine cost an afternoon and three
+ * failures, none of which named its own cause:
  *
- * The common thread is that every check reported success right up until the
- * moment something real was attempted. So this script does not trust version
- * numbers or imports: it BUILDS a MediaPipe graph, DECODES with OpenCV, and
- * only then calls the install good.
+ *   Python 3.8 on PATH   -> pip said "no version satisfies absl-py==2.4.0",
+ *                           which reads as a missing package. pip only lists
+ *                           wheels the running Python can use, and never
+ *                           mentions that it is filtering.
+ *   opencv-headless 4.9  -> predates NumPy 2, so `import cv2` died with
+ *                           "_ARRAY_API not found"; and being headless it had
+ *                           no cv2.imshow, which the whole collector needs.
+ *   protobuf 7           -> removed two APIs MediaPipe calls. `import
+ *                           mediapipe` still SUCCEEDED and only failed later,
+ *                           when a camera actually started.
  *
- * Safe to run repeatedly. It never overwrites an existing .env — losing your
- * API keys to a setup script is its own kind of bad afternoon.
+ * Every one of those passed a naive check. So the final step here builds a
+ * real MediaPipe graph and decodes a real frame instead of trusting imports.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -42,174 +44,282 @@ const WIN = process.platform === 'win32';
 const VENV = join(ROOT, 'venv');
 const VENV_PY = WIN ? join(VENV, 'Scripts', 'python.exe')
                     : join(VENV, 'bin', 'python');
+const CHECK_ONLY = process.argv.includes('--check');
 
-// MediaPipe 0.10.14 publishes wheels for 3.8-3.12; numpy 2.4.x needs >= 3.11.
-// The intersection is the only range where a clean install is possible.
-const PY_MIN = [3, 11];
-const PY_MAX = [3, 12];
+// mediapipe 0.10.14 ships wheels for 3.8-3.12; numpy 2.4.x needs >= 3.11.
+// That intersection is the only range where a clean install is possible.
+const PY_MIN = [3, 11], PY_MAX = [3, 12];
 
-let failed = false;
-
-const c = {
-  bold: s => `\x1b[1m${s}\x1b[0m`,
-  dim: s => `\x1b[2m${s}\x1b[0m`,
-  red: s => `\x1b[31m${s}\x1b[0m`,
-  green: s => `\x1b[32m${s}\x1b[0m`,
-  yellow: s => `\x1b[33m${s}\x1b[0m`,
+const C = {
+  b: s => `\x1b[1m${s}\x1b[0m`,   d: s => `\x1b[2m${s}\x1b[0m`,
+  r: s => `\x1b[31m${s}\x1b[0m`,  g: s => `\x1b[32m${s}\x1b[0m`,
+  y: s => `\x1b[33m${s}\x1b[0m`,  c: s => `\x1b[36m${s}\x1b[0m`,
 };
-
-const step = t => console.log(`\n${c.bold(t)}\n${'-'.repeat(t.length)}`);
-const ok = m => console.log(`  ${c.green('OK')}    ${m}`);
-const warn = m => console.log(`  ${c.yellow('WARN')}  ${m}`);
-const bad = m => { failed = true; console.log(`  ${c.red('FAIL')}  ${m}`); };
-const note = m => console.log(`        ${c.dim(m)}`);
-
-function run(cmd, args, opts = {}) {
-  return spawnSync(cmd, args, { encoding: 'utf8', cwd: ROOT, ...opts });
-}
-function runLoud(cmd, args) {
-  return spawnSync(cmd, args, { stdio: 'inherit', cwd: ROOT });
-}
-
-// ── 1. Interpreter ───────────────────────────────────────────────────────────
-// Finding a USABLE python, not just any python. This is the check that would
-// have saved the most time: the failure it prevents disguises itself as a
-// missing package.
-
-function parseVersion(out) {
-  const m = /Python (\d+)\.(\d+)\.(\d+)/.exec(out || '');
-  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
-}
+const run  = (cmd, args, o = {}) => spawnSync(cmd, args, { encoding: 'utf8', cwd: ROOT, ...o });
+const loud = (cmd, args) => spawnSync(cmd, args, { stdio: 'inherit', cwd: ROOT });
+const norm = s => s.toLowerCase().replace(/[_.]/g, '-');
+const parseVer = o => { const m = /Python (\d+)\.(\d+)\.(\d+)/.exec(o || ''); return m ? [+m[1], +m[2], +m[3]] : null; };
 const cmp = (a, b) => a[0] - b[0] || a[1] - b[1];
 
-function findPython() {
-  const candidates = WIN
+// ═══════════════════════════════════════════════════════════════════════════
+//  PHASE 1 — SCAN.  Reads only. Changes nothing.
+// ═══════════════════════════════════════════════════════════════════════════
+
+console.log('\n' + '='.repeat(66));
+console.log(C.b('  TARJUMAN SETUP') + C.d('   —  scanning this machine'));
+console.log('='.repeat(66));
+
+const S = {};   // scan results
+
+// -- interpreter --------------------------------------------------------------
+(() => {
+  const cands = WIN
     ? [['py', ['-3.11']], ['py', ['-3.12']], ['python', []], ['python3', []]]
     : [['python3.11', []], ['python3.12', []], ['python3', []], ['python', []]];
-
   const seen = [];
-  for (const [cmd, pre] of candidates) {
+  for (const [cmd, pre] of cands) {
     const r = run(cmd, [...pre, '--version']);
     if (r.error || r.status !== 0) continue;
-    const v = parseVersion((r.stdout || '') + (r.stderr || ''));
+    const v = parseVer((r.stdout || '') + (r.stderr || ''));
     if (!v) continue;
-    seen.push(`${cmd} ${pre.join(' ')}`.trim() + ` -> ${v.join('.')}`);
-    if (cmp(v, PY_MIN) >= 0 && cmp(v, PY_MAX) <= 0) return { cmd, pre, v };
+    seen.push(`${[cmd, ...pre].join(' ')} -> ${v.join('.')}`);
+    if (cmp(v, PY_MIN) >= 0 && cmp(v, PY_MAX) <= 0) { S.py = { cmd, pre, v, seen }; return; }
   }
-  return { cmd: null, seen };
-}
+  S.py = { cmd: null, seen };
+})();
 
-step('1. Python interpreter');
-const py = findPython();
-if (!py.cmd) {
-  bad(`No Python between ${PY_MIN.join('.')} and ${PY_MAX.join('.')} found.`);
-  if (py.seen?.length) {
-    note('Interpreters detected:');
-    py.seen.forEach(s => note('  ' + s));
-  }
-  note('');
-  note('Install Python 3.11 and re-run `npm run setup`:');
-  note(WIN ? '  winget install Python.Python.3.11'
-           : '  sudo apt install python3.11 python3.11-venv');
-  note('On Windows, tick "Add python.exe to PATH" in the installer.');
-  note('');
-  note('Why this is strict: on an older Python, pip hides every wheel it');
-  note('cannot use and then reports "no matching distribution" — which looks');
-  note('like a broken requirements file rather than a wrong interpreter.');
-  process.exit(1);
-}
-ok(`Python ${py.v.join('.')} (${py.cmd} ${py.pre.join(' ')}`.trim() + ')');
+// -- node ---------------------------------------------------------------------
+S.node = (() => {
+  const r = run(WIN ? 'npm.cmd' : 'npm', ['--version']);
+  return { ok: r.status === 0, version: (r.stdout || '').trim(), nodeVersion: process.version };
+})();
 
-// ── 2. Virtual environment ───────────────────────────────────────────────────
-step('2. Virtual environment');
-
-// On a Raspberry Pi, picamera2 and libcamera are installed by apt into the
-// SYSTEM python and cannot be pip-installed. A plain venv is sealed off from
-// them, so the CSI camera silently reports itself as unavailable.
-const onPi = process.platform === 'linux' && /arm|aarch/.test(process.arch);
-
-if (!existsSync(VENV_PY)) {
-  const args = [...py.pre, '-m', 'venv'];
-  if (onPi) args.push('--system-site-packages');
-  args.push('venv');
-  console.log(`  creating venv${onPi ? ' (--system-site-packages, for picamera2)' : ''}...`);
-  const r = runLoud(py.cmd, args);
-  if (r.status !== 0 || !existsSync(VENV_PY)) {
-    bad('Could not create the virtual environment.');
-    process.exit(1);
-  }
-  ok('venv created');
-} else {
+// -- venv ---------------------------------------------------------------------
+S.venv = (() => {
+  if (!existsSync(VENV_PY)) return { state: 'missing' };
   const r = run(VENV_PY, ['--version']);
-  const v = parseVersion((r.stdout || '') + (r.stderr || ''));
-  if (!v || cmp(v, PY_MIN) < 0 || cmp(v, PY_MAX) > 0) {
-    bad(`Existing venv runs Python ${v ? v.join('.') : 'unknown'} — out of range.`);
-    note('It was built by the wrong interpreter. Delete it and re-run:');
-    note(WIN ? '  rmdir /s /q venv' : '  rm -rf venv');
-    process.exit(1);
+  const v = parseVer((r.stdout || '') + (r.stderr || ''));
+  if (!v) return { state: 'broken' };
+  if (cmp(v, PY_MIN) < 0 || cmp(v, PY_MAX) > 0) return { state: 'wrong-python', v };
+  return { state: 'ok', v };
+})();
+
+// -- python packages: compare requirements.txt against what is installed ------
+// Done by reading pip's own list rather than by attempting an install, so the
+// scan stays offline and instant.
+S.pkgs = { missing: [], wrong: [], opencv: [], satisfied: 0, checked: false };
+if (S.venv.state === 'ok') {
+  const freeze = run(VENV_PY, ['-m', 'pip', 'list', '--format=freeze']).stdout || '';
+  const have = new Map();
+  for (const line of freeze.split('\n')) {
+    const [n, v] = line.trim().split('==');
+    if (n) have.set(norm(n), v);
   }
-  ok(`venv present, Python ${v.join('.')}`);
+  S.pkgs.opencv = [...have.keys()].filter(k => k.startsWith('opencv'));
+  const req = readFileSync(join(ROOT, 'requirements.txt'), 'utf8').split('\n');
+  for (const raw of req) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const m = /^([A-Za-z0-9._-]+)==([^\s;]+)/.exec(line);
+    if (!m) continue;
+    const [, name, want] = m;
+    const got = have.get(norm(name));
+    if (!got) S.pkgs.missing.push(`${name}==${want}`);
+    else if (got !== want) S.pkgs.wrong.push(`${name}: have ${got}, need ${want}`);
+    else S.pkgs.satisfied++;
+  }
+  S.pkgs.checked = true;
+}
+S.pinnedCv = (readFileSync(join(ROOT, 'requirements.txt'), 'utf8')
+  .split('\n').map(l => l.trim()).find(l => /^opencv[\w-]*==/.test(l))) || '';
+
+// -- node_modules -------------------------------------------------------------
+S.nodeModules = existsSync(join(ROOT, 'node_modules'));
+
+// -- .env ---------------------------------------------------------------------
+S.env = (() => {
+  if (!existsSync(join(ROOT, '.env'))) return { state: 'missing' };
+  const body = readFileSync(join(ROOT, '.env'), 'utf8');
+  const empty = ['OPENROUTER_API_KEY', 'GROQ_API_KEY']
+    .filter(k => !new RegExp(`^${k}=.+`, 'm').test(body));
+  return { state: 'present', empty };
+})();
+
+// ── report ───────────────────────────────────────────────────────────────────
+const row = (label, status, detail = '') => {
+  const tag = { ok: C.g('  OK  '), fix: C.y(' FIX  '), block: C.r('BLOCK '), skip: C.d(' --   ') }[status];
+  console.log(`  ${tag} ${label.padEnd(22)} ${detail}`);
+};
+
+console.log();
+const todo = [];
+const blockers = [];
+
+if (S.py.cmd) row('Python', 'ok', `${S.py.v.join('.')}  (${[S.py.cmd, ...S.py.pre].join(' ')})`);
+else { row('Python', 'block', `need ${PY_MIN.join('.')}–${PY_MAX.join('.')}`); blockers.push('python'); }
+
+if (S.node.ok) row('Node / npm', 'ok', `node ${S.node.nodeVersion}, npm ${S.node.version}`);
+else { row('Node / npm', 'block', 'not found'); blockers.push('node'); }
+
+if (S.venv.state === 'ok') row('venv', 'ok', `Python ${S.venv.v.join('.')}`);
+else if (S.venv.state === 'missing') { row('venv', 'fix', 'not created yet'); todo.push('venv'); }
+else if (S.venv.state === 'wrong-python') { row('venv', 'fix', `built with Python ${S.venv.v.join('.')} — will rebuild`); todo.push('venv-rebuild'); }
+else { row('venv', 'fix', 'unreadable — will rebuild'); todo.push('venv-rebuild'); }
+
+if (!S.pkgs.checked) row('Python packages', 'skip', 'needs a venv first');
+else {
+  const bad = S.pkgs.missing.length + S.pkgs.wrong.length;
+  if (bad === 0) row('Python packages', 'ok', `${S.pkgs.satisfied} pinned packages satisfied`);
+  else {
+    row('Python packages', 'fix', `${S.pkgs.satisfied} ok, ${S.pkgs.missing.length} missing, ${S.pkgs.wrong.length} wrong version`);
+    [...S.pkgs.missing.slice(0, 6)].forEach(p => console.log(C.d(`           missing: ${p}`)));
+    if (S.pkgs.missing.length > 6) console.log(C.d(`           ...and ${S.pkgs.missing.length - 6} more`));
+    S.pkgs.wrong.slice(0, 6).forEach(p => console.log(C.d(`           ${p}`)));
+    todo.push('pip');
+  }
 }
 
-// ── 3. Dependencies ──────────────────────────────────────────────────────────
-step('3. Python dependencies');
-run(VENV_PY, ['-m', 'pip', 'install', '--upgrade', 'pip', '--quiet']);
-console.log('  installing requirements.txt (this takes a few minutes)...');
-if (runLoud(VENV_PY, ['-m', 'pip', 'install', '-r', 'requirements.txt']).status !== 0) {
-  bad('pip install failed — see the output above.');
+if (S.pkgs.checked) {
+  if (S.pkgs.opencv.length > 1) {
+    row('OpenCV', 'fix', `${S.pkgs.opencv.length} packages installed — they overwrite each other`);
+    S.pkgs.opencv.forEach(p => console.log(C.d(`           ${p}`)));
+    todo.push('opencv');
+  } else if (S.pkgs.opencv.length === 1) row('OpenCV', 'ok', S.pkgs.opencv[0]);
+  else { row('OpenCV', 'fix', 'not installed'); }
+}
+
+if (S.nodeModules) row('node_modules', 'ok', 'present — will not reinstall');
+else { row('node_modules', 'fix', 'missing'); todo.push('npm'); }
+
+if (S.env.state === 'present') {
+  if (S.env.empty.length) row('.env', 'ok', C.y(`present (no value for ${S.env.empty.join(', ')})`));
+  else row('.env', 'ok', 'present, keys set');
+} else { row('.env', 'fix', 'will create from .env.example'); todo.push('env'); }
+
+// ── blockers stop everything ─────────────────────────────────────────────────
+if (blockers.length) {
+  console.log('\n' + '='.repeat(66));
+  console.log(C.r(C.b('  CANNOT CONTINUE — install these first')));
+  console.log('='.repeat(66));
+  if (blockers.includes('python')) {
+    console.log(`\n  ${C.b('Python 3.11')}`);
+    if (S.py.seen?.length) { console.log(C.d('    detected instead:')); S.py.seen.forEach(s => console.log(C.d('      ' + s))); }
+    console.log(C.c(WIN ? '    winget install Python.Python.3.11'
+                        : '    sudo apt install python3.11 python3.11-venv'));
+    if (WIN) console.log(C.d('    Tick "Add python.exe to PATH" in the installer.'));
+    console.log(C.d('    Needed because an older Python makes pip hide every wheel it'));
+    console.log(C.d('    cannot use, then report a "missing package" instead.'));
+  }
+  if (blockers.includes('node')) {
+    console.log(`\n  ${C.b('Node.js LTS')}`);
+    console.log(C.c(WIN ? '    winget install OpenJS.NodeJS.LTS'
+                        : '    sudo apt install nodejs npm'));
+  }
+  console.log(C.d('\n  Then open a NEW terminal and run  npm run setup  again.'));
+  console.log(C.d('  (PATH changes are not visible to an already-open window.)\n'));
   process.exit(1);
 }
-ok('requirements installed');
 
-// ── 4. Untangle OpenCV ───────────────────────────────────────────────────────
-// Every OpenCV distribution writes the SAME cv2/ directory, so installing two
-// of them leaves whichever was written last in charge. pip list then shows a
-// package that is not the one Python imports, and uninstalling one can leave
-// the other's binaries behind. That mismatch is invisible until import fails.
-step('4. OpenCV consistency');
-
-const pinned = (readFileSync(join(ROOT, 'requirements.txt'), 'utf8')
-  .split('\n').find(l => /^opencv[-\w]*==/.test(l.trim())) || '').trim();
-
-const freeze = run(VENV_PY, ['-m', 'pip', 'list', '--format=freeze']).stdout || '';
-const installed = freeze.split('\n')
-  .map(l => l.trim()).filter(l => /^opencv/i.test(l));
-
-if (installed.length > 1) {
-  warn(`${installed.length} OpenCV packages installed — they overwrite each other:`);
-  installed.forEach(p => note('  ' + p));
-  console.log('  removing all, then installing only the pinned one...');
-  runLoud(VENV_PY, ['-m', 'pip', 'uninstall', '-y',
-    'opencv-python', 'opencv-python-headless',
-    'opencv-contrib-python', 'opencv-contrib-python-headless']);
-  // pip leaves files it did not register. Whatever survives here would still
-  // shadow the fresh install, so the directory goes too.
-  const cv2dir = join(VENV, WIN ? 'Lib' : `lib/python${py.v[0]}.${py.v[1]}`,
-                      'site-packages', 'cv2');
-  try { rmSync(cv2dir, { recursive: true, force: true }); } catch { /* absent */ }
-  if (pinned) runLoud(VENV_PY, ['-m', 'pip', 'install', pinned]);
-  ok('OpenCV reinstalled cleanly');
-} else if (installed.length === 1) {
-  ok(installed[0]);
+// ── nothing to do? ───────────────────────────────────────────────────────────
+console.log();
+if (!todo.length) {
+  console.log(C.g('  Everything is already in place — nothing to install.'));
+} else if (CHECK_ONLY) {
+  console.log(C.b(`  ${todo.length} thing(s) need attention.`) + C.d('  Run  npm run setup  to fix.'));
+  process.exit(0);
 } else {
-  bad('No OpenCV installed.');
+  console.log(C.b('  PLAN') + C.d('  (only what is missing above)'));
+  const plan = {
+    'venv': 'create the virtual environment',
+    'venv-rebuild': 'rebuild the virtual environment with the correct Python',
+    'pip': 'install the missing Python packages',
+    'opencv': 'remove the duplicate OpenCV packages and reinstall the pinned one',
+    'npm': 'npm install',
+    'env': 'create .env from .env.example (existing files are never touched)',
+  };
+  todo.forEach(t => console.log(`    • ${plan[t]}`));
 }
 
-// ── 5. Prove it actually works ───────────────────────────────────────────────
-// The important part. Imports succeeding proved nothing in any of the three
-// failures this script exists to catch.
-step('5. Verification (building real objects, not just importing)');
+// ═══════════════════════════════════════════════════════════════════════════
+//  PHASE 2 — APPLY
+// ═══════════════════════════════════════════════════════════════════════════
+
+const onPi = process.platform === 'linux' && /arm|aarch/.test(process.arch);
+let failed = false;
+const fail = m => { failed = true; console.log(`  ${C.r('FAIL')}  ${m}`); };
+const done = m => console.log(`  ${C.g('OK')}    ${m}`);
+const head = t => console.log(`\n${C.b(t)}\n${'-'.repeat(t.length)}`);
+
+if (todo.includes('venv') || todo.includes('venv-rebuild')) {
+  head('Creating the virtual environment');
+  if (todo.includes('venv-rebuild')) rmSync(VENV, { recursive: true, force: true });
+  // On a Pi, picamera2 and libcamera come from apt into the SYSTEM python and
+  // cannot be pip-installed. A sealed venv makes the CSI camera look absent.
+  const args = [...S.py.pre, '-m', 'venv', ...(onPi ? ['--system-site-packages'] : []), 'venv'];
+  if (onPi) console.log(C.d('  using --system-site-packages so picamera2 stays visible'));
+  loud(S.py.cmd, args);
+  existsSync(VENV_PY) ? done('venv ready') : fail('could not create venv');
+  if (failed) process.exit(1);
+  todo.push('pip');            // a new venv is empty by definition
+}
+
+if (todo.includes('pip')) {
+  head('Installing Python packages');
+  run(VENV_PY, ['-m', 'pip', 'install', '--upgrade', 'pip', '--quiet']);
+  console.log(C.d('  this is the slow part — a few minutes on a fresh venv\n'));
+  if (loud(VENV_PY, ['-m', 'pip', 'install', '-r', 'requirements.txt']).status !== 0) {
+    fail('pip install failed — see above'); process.exit(1);
+  }
+  done('packages installed');
+}
+
+if (todo.includes('opencv')) {
+  head('Untangling OpenCV');
+  console.log(C.d('  Every OpenCV distribution writes the same cv2/ directory, so'));
+  console.log(C.d('  the last one installed wins and pip list stops matching what'));
+  console.log(C.d('  Python imports. Removing all, then installing one.\n'));
+  loud(VENV_PY, ['-m', 'pip', 'uninstall', '-y', 'opencv-python',
+    'opencv-python-headless', 'opencv-contrib-python', 'opencv-contrib-python-headless']);
+  // pip leaves behind files it never registered; those would shadow the new
+  // install, so the directory itself goes.
+  const site = join(VENV, WIN ? 'Lib' : `lib/python${S.py.v[0]}.${S.py.v[1]}`, 'site-packages', 'cv2');
+  try { rmSync(site, { recursive: true, force: true }); } catch { /* already gone */ }
+  if (S.pinnedCv) loud(VENV_PY, ['-m', 'pip', 'install', S.pinnedCv]);
+  done('OpenCV reinstalled cleanly');
+}
+
+if (todo.includes('npm')) {
+  head('Installing Node packages');
+  loud(WIN ? 'npm.cmd' : 'npm', ['install']);
+  existsSync(join(ROOT, 'node_modules')) ? done('node_modules ready') : fail('npm install did not complete');
+}
+
+if (todo.includes('env')) {
+  head('Configuration');
+  // Never overwrite: a `copy .env.example .env` prompt answered "yes" during a
+  // real setup destroyed a working key file. A setup script must not be able
+  // to do that, so this branch only runs when .env does not exist at all.
+  if (existsSync(join(ROOT, '.env.example'))) {
+    copyFileSync(join(ROOT, '.env.example'), join(ROOT, '.env'));
+    done('.env created from .env.example');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  VERIFY — build real objects, because imports proved nothing
+// ═══════════════════════════════════════════════════════════════════════════
+head('Verifying (building real objects, not just importing)');
 
 const PROBE = `
-import sys, json
+import json
 r = {}
 try:
     import numpy; r['numpy'] = numpy.__version__
 except Exception as e: r['numpy_error'] = str(e)
 try:
-    import cv2; r['cv2'] = cv2.__version__
-    import numpy as np
-    r['cv2_decode'] = bool(cv2.cvtColor(np.zeros((4,4,3), np.uint8), cv2.COLOR_BGR2RGB).shape)
+    import cv2, numpy as np; r['cv2'] = cv2.__version__
+    cv2.cvtColor(np.zeros((4,4,3), np.uint8), cv2.COLOR_BGR2RGB)
+    r['cv2_decode'] = True
     r['cv2_gui'] = hasattr(cv2, 'imshow')
 except Exception as e: r['cv2_error'] = f'{type(e).__name__}: {e}'
 try:
@@ -226,88 +336,54 @@ try:
 except Exception as e: r['onnxruntime_error'] = str(e)
 print('<<<' + json.dumps(r) + '>>>')
 `;
-
 const probe = run(VENV_PY, ['-c', PROBE]);
-const raw = ((probe.stdout || '') + (probe.stderr || ''));
-const m = /<<<(.*)>>>/s.exec(raw);
-const R = m ? JSON.parse(m[1]) : {};
+const raw = (probe.stdout || '') + (probe.stderr || '');
+const mm = /<<<(.*)>>>/s.exec(raw);
+const R = mm ? JSON.parse(mm[1]) : null;
 
-if (!m) {
-  bad('The verification probe did not complete.');
-  note(raw.trim().split('\n').slice(-6).join('\n        '));
+if (!R) {
+  fail('the verification probe did not complete');
+  console.log(C.d('        ' + raw.trim().split('\n').slice(-6).join('\n        ')));
 } else {
-  R.numpy ? ok(`numpy ${R.numpy}`) : bad(`numpy: ${R.numpy_error}`);
+  R.numpy ? done(`numpy ${R.numpy}`) : fail(`numpy: ${R.numpy_error}`);
 
   if (R.cv2_error) {
-    bad(`cv2: ${R.cv2_error}`);
-    if (/_ARRAY_API|multiarray/.test(R.cv2_error)) {
-      note('This OpenCV build predates NumPy 2. Fix with:');
-      note(`  ${pinned || 'opencv-contrib-python'}`);
-    }
+    fail(`cv2: ${R.cv2_error}`);
+    if (/_ARRAY_API|multiarray/.test(R.cv2_error))
+      console.log(C.d(`        This OpenCV predates NumPy 2. Fix:  pip install ${S.pinnedCv}`));
   } else {
-    ok(`cv2 ${R.cv2} (decode verified)`);
-    R.cv2_gui ? ok('cv2 has a GUI — collector/test windows will open')
-              : bad('cv2 is a HEADLESS build: cv2.imshow does not exist, so ' +
-                    '`npm run collect` and `npm run test` cannot show a window.');
+    done(`cv2 ${R.cv2} (decoded a frame)`);
+    R.cv2_gui ? done('cv2 has a GUI — collector and test windows will open')
+              : fail('cv2 is a HEADLESS build: no cv2.imshow, so npm run collect / test cannot show a window');
   }
 
   if (R.mediapipe_error) {
-    bad(`mediapipe: ${R.mediapipe_error}`);
+    fail(`mediapipe: ${R.mediapipe_error}`);
     if (/label|GetPrototype|Descriptor/.test(R.mediapipe_error)) {
-      note(`protobuf ${R.protobuf || '?'} removed APIs MediaPipe still calls.`);
-      note('Fix with:  npm run fix');
+      console.log(C.d(`        protobuf ${R.protobuf || '?'} removed APIs MediaPipe calls.`));
+      console.log(C.d('        Fix:  npm run fix'));
     }
-  } else {
-    ok(`mediapipe ${R.mediapipe} (built a real Hands graph)`);
-  }
+  } else done(`mediapipe ${R.mediapipe} (built a real Hands graph)`);
 
-  R.onnxruntime ? ok(`onnxruntime ${R.onnxruntime}`)
-                : bad(`onnxruntime: ${R.onnxruntime_error}`);
+  R.onnxruntime ? done(`onnxruntime ${R.onnxruntime}`) : fail(`onnxruntime: ${R.onnxruntime_error}`);
 }
 
-// ── 6. Node packages ─────────────────────────────────────────────────────────
-step('6. Node packages');
-if (!existsSync(join(ROOT, 'node_modules'))) {
-  runLoud(WIN ? 'npm.cmd' : 'npm', ['install']);
-}
-existsSync(join(ROOT, 'node_modules')) ? ok('node_modules present')
-                                       : warn('npm install did not complete');
-
-// ── 7. .env — create, NEVER overwrite ────────────────────────────────────────
-step('7. Configuration');
-const ENV = join(ROOT, '.env');
-if (existsSync(ENV)) {
-  // Deliberate: a `copy .env.example .env` prompt was answered "yes" during
-  // the real setup and silently destroyed a working key file. A setup script
-  // must never be able to do that.
-  ok('.env exists — left untouched');
-  const body = readFileSync(ENV, 'utf8');
-  const empty = ['OPENROUTER_API_KEY', 'GROQ_API_KEY']
-    .filter(k => !new RegExp(`^${k}=.+`, 'm').test(body));
-  if (empty.length) {
-    warn(`No value set for: ${empty.join(', ')}`);
-    note('collect / train / test work without these.');
-    note('The server (npm run dev:browser) will refuse to start.');
-  }
-} else if (existsSync(join(ROOT, '.env.example'))) {
-  copyFileSync(join(ROOT, '.env.example'), ENV);
-  ok('.env created from .env.example');
-  warn('Add your OPENROUTER_API_KEY and GROQ_API_KEY before running the server.');
-}
-
-// ── Summary ──────────────────────────────────────────────────────────────────
-console.log('\n' + '='.repeat(64));
+// ── summary ──────────────────────────────────────────────────────────────────
+console.log('\n' + '='.repeat(66));
 if (failed) {
-  console.log(c.red(c.bold('  SETUP INCOMPLETE — see the FAIL lines above')));
-  console.log('='.repeat(64));
+  console.log(C.r(C.b('  SETUP INCOMPLETE — see the FAIL lines above')));
+  console.log('='.repeat(66) + '\n');
   process.exit(1);
 }
-console.log(c.green(c.bold('  READY')));
-console.log('='.repeat(64));
+console.log(C.g(C.b('  READY')));
+console.log('='.repeat(66));
+if (S.env.state === 'missing' || S.env.empty?.length)
+  console.log(C.y('\n  Add OPENROUTER_API_KEY and GROQ_API_KEY to .env before running the server.') +
+              C.d('\n  (collect / train / test work without them)'));
 console.log(`
   npm run collect   record signs
   npm run train     train the model
   npm run test      try it live on camera
 
-  Full command reference: COMMANDS.md
+  Reference: COMMANDS.md
 `);
