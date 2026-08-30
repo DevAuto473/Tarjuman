@@ -65,9 +65,19 @@ const loud = (cmd, args, o = {}) => spawnSync(cmd, args, { stdio: 'inherit', cwd
 // spawn .cmd/.bat files unless shell:true is set. Without it this reported
 // "Node / npm not found" on a machine that had just launched this very script
 // through npm — a false blocker, which is the worst kind for a setup tool.
-const npm = (args, o = {}) =>
-  spawnSync(WIN ? 'npm.cmd' : 'npm', args,
-            { encoding: 'utf8', cwd: ROOT, shell: WIN, ...o });
+//
+// The command is built as ONE string rather than command + args array: with
+// shell:true, an args array triggers Node's DEP0190 warning, because the shell
+// would concatenate the parts unescaped. Every argument here is a literal
+// defined in this file, so there is nothing to escape — but a setup tool that
+// prints a security warning teaches people to ignore warnings, which is worse
+// than the warning itself.
+const npm = (args, o = {}) => {
+  const cmd = `npm ${args.join(' ')}`;
+  return WIN
+    ? spawnSync(cmd, { encoding: 'utf8', cwd: ROOT, shell: true, ...o })
+    : spawnSync('npm', args, { encoding: 'utf8', cwd: ROOT, ...o });
+};
 const norm = s => s.toLowerCase().replace(/[_.]/g, '-');
 const parseVer = o => { const m = /Python (\d+)\.(\d+)\.(\d+)/.exec(o || ''); return m ? [+m[1], +m[2], +m[3]] : null; };
 const cmp = (a, b) => a[0] - b[0] || a[1] - b[1];
