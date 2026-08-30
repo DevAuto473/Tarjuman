@@ -58,7 +58,16 @@ opt_einsum==3.4.0
 packaging==26.3
 pandas==3.0.5
 pillow==12.2.0
-pip==26.0.1
+# pip is deliberately NOT pinned here.
+#
+# It used to read pip==26.0.1, which produced a small but confusing loop:
+# `npm run setup` upgrades pip first, then installs requirements.txt, which
+# immediately DOWNGRADED pip again — visible in the install log as
+# "Uninstalling pip-26.2.1 ... Successfully installed pip-26.0.1".
+#
+# pip is the tool doing the installing, not something this project imports.
+# Pinning it only freezes the installer at whatever version happened to be on
+# one machine the day requirements were frozen.
 propcache==0.5.2
 protobuf==4.25.9
 pycparser==3.0
