@@ -40,7 +40,20 @@ numpy==2.4.6
 onnx==1.22.0
 onnxruntime==1.28.0
 openai==2.41.1
-opencv-python-headless==4.9.0.80
+# OpenCV — install exactly ONE of these. They all provide the same `cv2`
+# module and overwrite each other's files, so the last one installed silently
+# wins and `pip list` shows a package that is not the one being imported.
+#
+# This pin used to read opencv-python-headless==4.9.0.80, which was wrong in
+# two ways at once:
+#   * headless builds ship NO GUI, yet data_collector and test_model are built
+#     entirely around cv2.imshow;
+#   * 4.9.0.80 predates NumPy 2 and was compiled against NumPy 1.x, so with
+#     numpy==2.4.6 it dies on import with "_ARRAY_API not found".
+# The dev laptop had opencv-contrib-python 5.0.0.93 installed on top by hand,
+# which is why everything worked there while a fresh clone could not even
+# import cv2. Recording what actually works, so the next machine matches.
+opencv-contrib-python==5.0.0.93
 opt_einsum==3.4.0
 packaging==26.2
 pandas==3.0.5
