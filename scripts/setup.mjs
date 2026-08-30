@@ -35,7 +35,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, copyFileSync, rmSync, readFileSync } from 'node:fs';
+import { existsSync, copyFileSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -45,6 +45,9 @@ const VENV = join(ROOT, 'venv');
 const VENV_PY = WIN ? join(VENV, 'Scripts', 'python.exe')
                     : join(VENV, 'bin', 'python');
 const CHECK_ONLY = process.argv.includes('--check');
+// Opt-ins for version drift. Neither happens by default: see the drift block.
+const SYNC_VERSIONS  = process.argv.includes('--sync-versions');   // machine -> pins
+const ADOPT_VERSIONS = process.argv.includes('--adopt-versions');  // pins -> machine
 
 // mediapipe 0.10.14 ships wheels for 3.8-3.12; numpy 2.4.x needs >= 3.11.
 // That intersection is the only range where a clean install is possible.
@@ -56,7 +59,15 @@ const C = {
   y: s => `\x1b[33m${s}\x1b[0m`,  c: s => `\x1b[36m${s}\x1b[0m`,
 };
 const run  = (cmd, args, o = {}) => spawnSync(cmd, args, { encoding: 'utf8', cwd: ROOT, ...o });
-const loud = (cmd, args) => spawnSync(cmd, args, { stdio: 'inherit', cwd: ROOT });
+const loud = (cmd, args, o = {}) => spawnSync(cmd, args, { stdio: 'inherit', cwd: ROOT, ...o });
+
+// npm on Windows is npm.cmd, and since the CVE-2024-27980 fix Node REFUSES to
+// spawn .cmd/.bat files unless shell:true is set. Without it this reported
+// "Node / npm not found" on a machine that had just launched this very script
+// through npm — a false blocker, which is the worst kind for a setup tool.
+const npm = (args, o = {}) =>
+  spawnSync(WIN ? 'npm.cmd' : 'npm', args,
+            { encoding: 'utf8', cwd: ROOT, shell: WIN, ...o });
 const norm = s => s.toLowerCase().replace(/[_.]/g, '-');
 const parseVer = o => { const m = /Python (\d+)\.(\d+)\.(\d+)/.exec(o || ''); return m ? [+m[1], +m[2], +m[3]] : null; };
 const cmp = (a, b) => a[0] - b[0] || a[1] - b[1];
@@ -90,8 +101,12 @@ const S = {};   // scan results
 
 // -- node ---------------------------------------------------------------------
 S.node = (() => {
-  const r = run(WIN ? 'npm.cmd' : 'npm', ['--version']);
-  return { ok: r.status === 0, version: (r.stdout || '').trim(), nodeVersion: process.version };
+  const r = npm(['--version']);
+  // If npm cannot be probed we are still RUNNING under node, so node itself is
+  // certainly present. Treat only npm as unknown rather than declaring the
+  // whole toolchain missing.
+  return { ok: r.status === 0, version: (r.stdout || '').trim() || 'unknown',
+           nodeVersion: process.version };
 })();
 
 // -- venv ---------------------------------------------------------------------
@@ -107,7 +122,7 @@ S.venv = (() => {
 // -- python packages: compare requirements.txt against what is installed ------
 // Done by reading pip's own list rather than by attempting an install, so the
 // scan stays offline and instant.
-S.pkgs = { missing: [], wrong: [], opencv: [], satisfied: 0, checked: false };
+S.pkgs = { missing: [], drift: [], opencv: [], satisfied: 0, checked: false };
 if (S.venv.state === 'ok') {
   const freeze = run(VENV_PY, ['-m', 'pip', 'list', '--format=freeze']).stdout || '';
   const have = new Map();
@@ -125,7 +140,7 @@ if (S.venv.state === 'ok') {
     const [, name, want] = m;
     const got = have.get(norm(name));
     if (!got) S.pkgs.missing.push(`${name}==${want}`);
-    else if (got !== want) S.pkgs.wrong.push(`${name}: have ${got}, need ${want}`);
+    else if (got !== want) S.pkgs.drift.push({ name, got, want });
     else S.pkgs.satisfied++;
   }
   S.pkgs.checked = true;
@@ -144,6 +159,65 @@ S.env = (() => {
     .filter(k => !new RegExp(`^${k}=.+`, 'm').test(body));
   return { state: 'present', empty };
 })();
+
+// -- camera -------------------------------------------------------------------
+// A dependency check that passes and then leaves you with no camera is only
+// half an answer: the first thing anyone runs is `npm run collect`, which
+// needs a working lens before it needs anything else. Probed here so the gap
+// shows up during setup rather than in the middle of a recording session.
+S.camera = { state: 'unknown', detail: '' };
+if (S.venv.state === 'ok' && !S.pkgs.missing.length) {
+  const CAM = `
+import json, sys
+out = {"backends": [], "picamera2": False}
+try:
+    from picamera2 import Picamera2
+    out["picamera2"] = len(Picamera2.global_camera_info()) > 0
+except Exception:
+    pass
+try:
+    import cv2, os
+    try: cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
+    except Exception: pass
+    for i in range(3):
+        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW) if os.name == 'nt' else cv2.VideoCapture(i)
+        try:
+            if cap.isOpened():
+                ok, f = cap.read()
+                if ok and f is not None:
+                    out["backends"].append([i, int(f.shape[1]), int(f.shape[0])])
+        finally:
+            cap.release()
+except Exception as e:
+    out["error"] = str(e)
+print('<<<' + json.dumps(out) + '>>>')
+`;
+  const r = run(VENV_PY, ['-c', CAM], { timeout: 45000 });
+  const cm = /<<<(.*)>>>/s.exec((r.stdout || '') + (r.stderr || ''));
+  if (cm) {
+    const cams = JSON.parse(cm[1]);
+    const n = (cams.backends || []).length;
+    if (cams.picamera2) { S.camera = { state: 'ok', detail: 'Raspberry Pi CSI camera detected' }; }
+    else if (n) {
+      S.camera = { state: 'ok',
+        detail: `${n} camera(s): ` + cams.backends.map(([i, w, h]) => `index ${i} ${w}x${h}`).join(', ') };
+    } else S.camera = { state: 'none', detail: 'no camera responded' };
+  }
+}
+
+// -- Rust (desktop app only) --------------------------------------------------
+S.rust = run('cargo', ['--version']).status === 0;
+
+// -- Raspberry Pi system packages ---------------------------------------------
+// picamera2 and libcamera come from apt, never from pip. `npm run setup`
+// cannot install them (they need sudo), so it names them precisely instead.
+S.pi = null;
+if (process.platform === 'linux' && /arm|aarch/.test(process.arch)) {
+  const hasPicam = S.venv.state === 'ok' &&
+    run(VENV_PY, ['-c', 'import picamera2']).status === 0;
+  S.pi = { picamera2: hasPicam, rpicam: run('which', ['rpicam-hello']).status === 0,
+           display: !!process.env.DISPLAY };
+}
 
 // ── report ───────────────────────────────────────────────────────────────────
 const row = (label, status, detail = '') => {
@@ -167,16 +241,31 @@ else if (S.venv.state === 'wrong-python') { row('venv', 'fix', `built with Pytho
 else { row('venv', 'fix', 'unreadable — will rebuild'); todo.push('venv-rebuild'); }
 
 if (!S.pkgs.checked) row('Python packages', 'skip', 'needs a venv first');
-else {
-  const bad = S.pkgs.missing.length + S.pkgs.wrong.length;
-  if (bad === 0) row('Python packages', 'ok', `${S.pkgs.satisfied} pinned packages satisfied`);
-  else {
-    row('Python packages', 'fix', `${S.pkgs.satisfied} ok, ${S.pkgs.missing.length} missing, ${S.pkgs.wrong.length} wrong version`);
-    [...S.pkgs.missing.slice(0, 6)].forEach(p => console.log(C.d(`           missing: ${p}`)));
-    if (S.pkgs.missing.length > 6) console.log(C.d(`           ...and ${S.pkgs.missing.length - 6} more`));
-    S.pkgs.wrong.slice(0, 6).forEach(p => console.log(C.d(`           ${p}`)));
-    todo.push('pip');
-  }
+else if (S.pkgs.missing.length) {
+  row('Python packages', 'fix', `${S.pkgs.satisfied} ok, ${S.pkgs.missing.length} missing`);
+  S.pkgs.missing.slice(0, 6).forEach(p => console.log(C.d(`           missing: ${p}`)));
+  if (S.pkgs.missing.length > 6) console.log(C.d(`           ...and ${S.pkgs.missing.length - 6} more`));
+  todo.push('pip');
+} else {
+  row('Python packages', 'ok', `${S.pkgs.satisfied} pinned packages satisfied`);
+}
+
+// Version DRIFT is reported but never "fixed" on its own.
+//
+// Downgrading packages that are installed and working is how you break a
+// machine that was fine a minute ago - and on this project that machine may
+// be the one that trained the model. Newer-than-pinned is usually harmless;
+// silently rolling scikit-learn back three minor versions is not. So drift is
+// surfaced, explained, and left to an explicit decision.
+if (S.pkgs.drift.length) {
+  const newer = S.pkgs.drift.filter(d => d.got > d.want).length;
+  row('Version drift', 'skip', `${S.pkgs.drift.length} package(s) differ from requirements.txt`);
+  S.pkgs.drift.slice(0, 8).forEach(d =>
+    console.log(C.d(`           ${d.name}: installed ${d.got}, pinned ${d.want}`)));
+  console.log(C.d(`           Not changed automatically — downgrading working packages`));
+  console.log(C.d(`           is riskier than the drift itself${newer ? ' (most are NEWER than pinned)' : ''}.`));
+  console.log(C.d(`           npm run setup -- --sync-versions   to force the pins`));
+  console.log(C.d(`           npm run setup -- --adopt-versions  to update requirements.txt to match`));
 }
 
 if (S.pkgs.checked) {
@@ -190,6 +279,30 @@ if (S.pkgs.checked) {
 
 if (S.nodeModules) row('node_modules', 'ok', 'present — will not reinstall');
 else { row('node_modules', 'fix', 'missing'); todo.push('npm'); }
+
+if (S.camera.state === 'ok') row('Camera', 'ok', S.camera.detail);
+else if (S.camera.state === 'none') {
+  row('Camera', 'skip', C.y('no camera responded'));
+  console.log(C.d('           collect / test need one. Check it is plugged in and that'));
+  console.log(C.d('           Zoom / Teams / OBS are not holding it open.'));
+} else if (S.venv.state === 'ok' && !S.pkgs.missing.length) row('Camera', 'skip', 'could not probe');
+
+if (S.pi) {
+  S.pi.picamera2 ? row('picamera2 (Pi)', 'ok', 'importable from the venv')
+                 : row('picamera2 (Pi)', 'skip', C.y('missing — CSI camera option will not appear'));
+  if (!S.pi.picamera2) {
+    console.log(C.d('           sudo apt install -y python3-picamera2 python3-libcamera'));
+    console.log(C.d('           apt, NOT pip: it is built against the system libcamera.'));
+    console.log(C.d('           The venv must also exist with --system-site-packages.'));
+  }
+  if (!S.pi.rpicam) console.log(C.d('           sudo apt install -y rpicam-apps   (for rpicam-hello --list-cameras)'));
+  if (!S.pi.display) {
+    row('Display (Pi)', 'skip', C.y('$DISPLAY not set — cv2.imshow cannot open a window'));
+    console.log(C.d('           Pi OS Lite has no GUI. Minimal X:'));
+    console.log(C.d('           sudo apt install -y --no-install-recommends xserver-xorg xinit openbox'));
+    console.log(C.d('           then:  startx &'));
+  }
+}
 
 if (S.env.state === 'present') {
   if (S.env.empty.length) row('.env', 'ok', C.y(`present (no value for ${S.env.empty.join(', ')})`));
@@ -263,8 +376,29 @@ if (todo.includes('venv') || todo.includes('venv-rebuild')) {
   todo.push('pip');            // a new venv is empty by definition
 }
 
+if (ADOPT_VERSIONS && S.pkgs.drift.length) {
+  head('Updating requirements.txt to match this machine');
+  console.log(C.d('  Recording what actually works here, so other machines match it.'));
+  console.log(C.d('  Use this on the machine that TRAINED the model — it is the one'));
+  console.log(C.d('  whose environment the model and dataset were produced under.\n'));
+  const path = join(ROOT, 'requirements.txt');
+  let text = readFileSync(path, 'utf8');
+  for (const d of S.pkgs.drift) {
+    const re = new RegExp(`^${d.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}==\\S+`, 'mi');
+    if (re.test(text)) {
+      text = text.replace(re, `${d.name}==${d.got}`);
+      console.log(`  ${C.g('OK')}    ${d.name}: ${d.want} -> ${d.got}`);
+    }
+  }
+  writeFileSync(path, text);
+  console.log(C.d('\n  Commit this change so the other machines pick it up.'));
+}
+
+if (SYNC_VERSIONS && S.pkgs.drift.length) todo.push('pip');
+
 if (todo.includes('pip')) {
   head('Installing Python packages');
+  if (SYNC_VERSIONS) console.log(C.y('  --sync-versions: pinned versions will be forced, including downgrades.\n'));
   run(VENV_PY, ['-m', 'pip', 'install', '--upgrade', 'pip', '--quiet']);
   console.log(C.d('  this is the slow part — a few minutes on a fresh venv\n'));
   if (loud(VENV_PY, ['-m', 'pip', 'install', '-r', 'requirements.txt']).status !== 0) {
@@ -290,7 +424,7 @@ if (todo.includes('opencv')) {
 
 if (todo.includes('npm')) {
   head('Installing Node packages');
-  loud(WIN ? 'npm.cmd' : 'npm', ['install']);
+  npm(['install'], { stdio: 'inherit', encoding: undefined });
   existsSync(join(ROOT, 'node_modules')) ? done('node_modules ready') : fail('npm install did not complete');
 }
 
@@ -380,6 +514,12 @@ console.log('='.repeat(66));
 if (S.env.state === 'missing' || S.env.empty?.length)
   console.log(C.y('\n  Add OPENROUTER_API_KEY and GROQ_API_KEY to .env before running the server.') +
               C.d('\n  (collect / train / test work without them)'));
+if (S.camera.state === 'none')
+  console.log(C.y('\n  No camera was detected — connect one before npm run collect.'));
+if (!S.rust)
+  console.log(C.d('\n  Rust is not installed, so the DESKTOP app (npm run dev:all / build)') +
+              C.d('\n  will not compile. Everything else works. Install from https://rustup.rs') +
+              C.d('\n  if you want it; npm run dev:browser needs no Rust at all.'));
 console.log(`
   npm run collect   record signs
   npm run train     train the model
