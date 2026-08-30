@@ -5,6 +5,7 @@
   "type": "module",
   "description": "Dev orchestration for Tarjuman: Python backend + Tauri frontend.",
   "scripts": {
+    "setup": "node scripts/setup.mjs",
     "dev:server": "node scripts/run-python.mjs websocket_server.py",
     "dev:app": "wait-on tcp:127.0.0.1:8765 && npm --prefix tarjuman run tauri dev",
     "dev:web": "wait-on tcp:127.0.0.1:8765 && npm --prefix tarjuman run dev",

@@ -187,20 +187,27 @@ TARJUMAN_NO_PROMPT=1      # تخطّي كل أسئلة الكاميرا
 
 ---
 
-## تشغيل المشروع على جهاز جديد
+## تشغيل المشروع على جهاز جديد — أمران فقط
 
 ```bash
 git clone https://github.com/DevAuto473/Tarjuman.git
 cd Tarjuman
-
-python -m venv venv                  # على الراسبيري: أضف --system-site-packages
-venv\Scripts\activate                # لينكس/ماك:  source venv/bin/activate
-pip install -r requirements.txt
-
-npm install
-cp .env.example .env                 # ويندوز: copy .env.example .env
-npm run test
+npm run setup
 ```
+
+`npm run setup` يتولّى كل شيء: يتحقّق من نسخة بايثون، ينشئ البيئة الافتراضية
+(مع `--system-site-packages` تلقائياً على الراسبيري)، يثبّت الحزم، يفكّ تشابك
+حِزم OpenCV إن وُجد، ثم **يتحقّق أن كل شيء يعمل فعلاً** — يبني رسم MediaPipe
+حقيقياً ويفكّ ترميز إطار بـ OpenCV، لا يكتفي بنجاح الاستيراد.
+
+آمن لإعادة التشغيل، **ولا يستبدل `.env` أبداً** إن كان موجوداً.
+
+يحتاج Node.js وPython 3.11 مثبَّتين مسبقاً — وإن نقص أحدهما يخبرك بأمر التثبيت الدقيق.
+
+> **لماذا وُجد هذا الأمر:** إعداد الجهاز الثاني استغرق ساعات وثلاثة أعطال، ولا
+> واحد منها ذكر سببه الحقيقي: بايثون ٣.٨ ظهر كأنه "حزمة مفقودة"، وOpenCV قديمة
+> انهارت مع NumPy 2، وprotobuf حديثة كسرت MediaPipe **بعد** نجاح الاستيراد.
+> `npm run setup` يكشف الثلاثة في ثوانٍ.
 
 **ما ينتقل عبر git:** الكود · `data/dynamic_gestures_v4.csv` · `data/labels.json` · `sign_model.onnx`
 
