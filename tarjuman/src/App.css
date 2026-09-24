@@ -1,13 +1,183 @@
 @import "tailwindcss";
 
-/* ── Global resets ──────────────────────────────────────────────────────── */
-*, *::before, *::after {
-  box-sizing: border-box;
-  margin: 0;
-  padding: 0;
+/* ═══════════════════════════════════════════════════════════════════════════
+   ترجمان — نظام التصميم
+   ===========================================================================
+   ثلاث قواعد تحكم كل قيمة هنا:
+
+   1. لونُ تمييزٍ واحد (brand) للأفعال. والألوان الدلالية (live/good/caution)
+      محجوزة لحالة النظام وحدها، لا تُستعمل زينةً أبداً — المستخدم الأصمّ يقرأ
+      حالة النظام بعينه، فحين يظهر الأحمر يجب أن يعني «أسجّل الآن».
+
+   2. مقاسٌ محدود العدد. ستّ درجات للخطّ، ثلاث لنصف القطر، ثلاثة ارتفاعات
+      للعناصر التفاعلية. الفوضى البصرية تأتي من كثرة القيم المتقاربة
+      (13 و13.5 و14 و14.5) لا من قلّة الأناقة.
+
+   3. كل المسافات من مضاعفات 4px، والفواصل الرأسية درجتان فقط:
+      12px داخل العمود، و16px بين المناطق الكبرى.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+@theme {
+  /* -- الأسطح ------------------------------------------------------------ */
+  --color-canvas:     #eceff2;
+  --color-surface:    #ffffff;
+  --color-sunken:     #f4f7f8;
+
+  /* -- النصّ -------------------------------------------------------------- */
+  --color-ink:        #101a21;
+  --color-ink-2:      #47585f;
+  --color-ink-3:      #6b7d86;   /* أدنى تباين مقبول على الأبيض (4.6:1) */
+
+  /* -- الحدود ------------------------------------------------------------ */
+  --color-hair:       #dfe6ea;
+  --color-hair-2:     #c7d3d9;
+
+  /* -- لون التمييز الوحيد ------------------------------------------------ */
+  --color-brand:      #1c3f77;
+  --color-brand-hi:   #2a5795;
+  --color-brand-wash: #e8eff9;
+
+  /* -- الحالات ------------------------------------------------------------ */
+  --color-live:         #c0342b;   /* تسجيل جارٍ */
+  --color-live-wash:    #fbe9e7;
+  --color-good:         #0e7d5c;   /* سليم */
+  --color-good-wash:    #e0f1eb;
+  --color-caution:      #9a5c0c;   /* تحذير */
+  --color-caution-wash: #f8eddc;
+
+  /* -- الخطوط ------------------------------------------------------------ */
+  --font-display: 'TarjumanSans', system-ui, sans-serif;
+  --font-sans:    'TarjumanSans', system-ui, sans-serif;
+
+  /* -- سلّم الخطّ: ستّ درجات، لا أكثر ---------------------------------------
+     كلّها بوحدة rem فتحترم إعداد حجم الخطّ في المتصفِّح، والمتغيّر الوحيد
+     محصور بين حدّين (النسبة بين الأدنى والأعلى ≤ 1.3) فيبقى التكبير 200%
+     صالحاً للقراءة. والارتفاعات سخيّة لأنّ الحركات العربية تحتاج مدى.       */
+  --text-2xs: 0.6875rem;   /* 11 — شارات وأرقام صغيرة */
+  --text-2xs--line-height: 1.5;
+  --text-xs: 0.75rem;      /* 12 — عناوين الحقول */
+  --text-xs--line-height: 1.55;
+  --text-sm: 0.8125rem;    /* 13 — نصّ ثانوي */
+  --text-sm--line-height: 1.65;
+  --text-base: 0.875rem;   /* 14 — نصّ الواجهة */
+  --text-base--line-height: 1.65;
+  --text-h2: 1.0625rem;    /* 17 — عناوين النوافذ */
+  --text-h2--line-height: 1.45;
+  --text-h1: 1.375rem;     /* 22 — اسم التطبيق */
+  --text-h1--line-height: 1.3;
+  --text-hero: clamp(1.375rem, 1.05rem + 1.1cqi, 1.75rem);  /* النصّ المترجَم */
+  --text-hero--line-height: 1.4;
+
+  /* -- نصف القطر: ثلاث درجات، متراكزة ------------------------------------
+     البطاقة 16، وما بداخلها 10، وأصغر عنصر 8. التدرّج نازل دائماً فلا تبدو
+     الزوايا الداخلية أوسع من الحاضنة.                                      */
+  --radius-card: 1rem;        /* 16 */
+  --radius-ctl:  0.625rem;    /* 10 */
+  --radius-chip: 0.5rem;      /* 8  */
+
+  /* -- الظلال: خفيفة، فالأرضية فاتحة والحدّ الرفيع يكفي ------------------- */
+  --shadow-card:   0 1px 2px rgb(16 26 33 / 0.04);
+  --shadow-raised: 0 1px 2px rgb(16 26 33 / 0.05), 0 2px 6px rgb(16 26 33 / 0.05);
+  --shadow-pop:    0 2px 8px rgb(16 26 33 / 0.06), 0 24px 60px -28px rgb(16 26 33 / 0.4);
 }
 
-html, body, #root {
-  width: 100%;
-  height: 100%;
+/* ── الخطّ الخاصّ ───────────────────────────────────────────────────────────
+   المصدر الأوّل ملفّ محلّي: ضَع نسخة في `public/fonts/thmanyah.ttf` ويعمل
+   التطبيق بلا إنترنت — وهو المهمّ في نسخة سطح المكتب. والرابط الخارجي
+   يبقى شبكة أمان فقط.                                                     */
+@font-face {
+  font-family: 'TarjumanSans';
+  src: url('https://cdn.jsdelivr.net/gh/DevAuto473/myfonts@main/fonts/1789303481986-TarjumanSans.ttf');
+  font-display: swap;
+}
+
+/* ── الأساس ─────────────────────────────────────────────────────────────────
+   ⚠️  داخل `@layer base` عن قصد، وهذا ليس تفصيلاً تجميلياً.
+   CSS غير المُدرَج في طبقة يتقدَّم على كلّ ما هو داخل طبقة مهما كانت
+   الأولوية (specificity)، وأدوات Tailwind كلّها في `@layer utilities`.
+   فالتصفير الشامل `* { margin: 0; padding: 0 }` بلا طبقة — وهو ما كان
+   هنا — يبتلع صامتاً كلَّ `p-4` و`gap-3` و`mb-2` في التطبيق بأكمله.
+   هذا هو السبب الحقيقي وراء الحشوات الغائبة والعناصر المتلاصقة.
+
+   والتصفير الشامل محذوف أصلاً: Preflight في Tailwind يقوم به.            */
+@layer base {
+  html, body, #root { width: 100%; height: 100%; overflow: hidden; }
+  html { background: var(--color-canvas); }
+
+  body {
+    background: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: var(--text-base);
+    line-height: var(--text-base--line-height);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* التركيز بلوحة المفاتيح يجب أن يُرى — الواجهة السابقة كانت تخفيه تماماً */
+  :focus-visible {
+    outline: 2px solid var(--color-brand);
+    outline-offset: 2px;
+    border-radius: var(--radius-chip);
+  }
+}
+
+/* ── أدوات صغيرة ────────────────────────────────────────────────────────── */
+
+/* حاضنة استعلام: تقيس القطعة المساحةَ المتاحة لها لا عرضَ النافذة، فتتصرّف
+   بشكل صحيح سواء كانت في عمود ضيّق أو عريض. */
+.cq { container-type: inline-size; }
+
+/* الأرقام تصطفّ في أعمدة (العدّادات، المدد، الدرجات) */
+.tnum { font-variant-numeric: tabular-nums; }
+
+/* أشرطة تمرير رفيعة داخل البطاقات */
+.scroll-thin { scrollbar-width: thin; scrollbar-color: var(--color-hair-2) transparent; }
+.scroll-thin::-webkit-scrollbar { width: 8px; height: 8px; }
+.scroll-thin::-webkit-scrollbar-thumb { background: var(--color-hair-2); border-radius: 999px; }
+.scroll-thin::-webkit-scrollbar-track { background: transparent; }
+
+/* ── أرضية المسرح ───────────────────────────────────────────────────────────
+   بقعتا لونٍ باهتتان (٧٪ و٦٪) لا تدرّجٌ ذو اتجاه: تمنحان العمق بلا حدٍّ مرئي
+   ولا اتجاه يسحب العين. الضجيج فوقهما بنسبة ٣٫٥٪ يمنع التشريط (banding) على
+   الشاشات ذات الثماني بتّات — وهو العيب الوحيد الذي يُفسد سطحاً كبيراً هادئاً.
+   مقاس البلاطة مثبّت، وإلّا تمدّد على الشاشات عالية الكثافة وصار وسخاً.     */
+.stage-field {
+  background-color: var(--color-sunken);
+  background-image:
+    radial-gradient(at 24% 16%, color-mix(in oklab, var(--color-brand) 7%, transparent) 0px, transparent 58%),
+    radial-gradient(at 82% 74%, color-mix(in oklab, var(--color-good)  6%, transparent) 0px, transparent 56%);
+}
+.stage-field::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.035;
+  background-size: 180px 180px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.8' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* ── تفضيلات المستخدم ───────────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* اللمس يحتاج أهدافاً أكبر من المؤشِّر — والاستعلام عن نوع المؤشِّر أصحّ من
+   الاستعلام عن عرض الشاشة: الحواسيب اللمسية والأجهزة اللوحية بقلم موجودة. */
+@media (pointer: coarse) {
+  .touch-target { min-block-size: 44px; min-inline-size: 44px; }
+}
+
+@media (forced-colors: active) {
+  .stage-field { background-image: none; }
+  .stage-field::after { display: none; }
+}
+
+@media print {
+  .stage-field::after { display: none; }
 }

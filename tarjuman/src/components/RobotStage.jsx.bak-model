@@ -1,0 +1,479 @@
+import React, { Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
+import { useGLTF, useAnimations, OrbitControls } from '@react-three/drei';
+import { useSignPlayer } from '../signing/useSignPlayer';
+
+/* مسار النموذج، ومعه رمز إصدار.
+ *
+ * كان هنا `/last1.glb` — وهو تصديرٌ سابقٌ للهيكل نفسه لكن بلا وجه، فكان
+ * الرأس يخرج أملس والطرفيّة تقول «لا أهداف تشكيل» بينما الوجه في `last.glb`
+ * طوال الوقت. اسمٌ واحدٌ للنموذج الحيّ، لا اثنان.
+ *
+ * والرمز يكسر ذاكرة المتصفّح: الملفّ 38 ميغابايت ويتغيّر نادراً، فيتشبّث
+ * المتصفّح بنسخته بعد كلّ تصدير.
+ *
+ * ⚠️  زِد الرمز كلّما أُعيد تصدير النموذج. */
+const MODEL_URL = '/last.glb?v=face-1';
+
+/* ═══ الروبوت ═══════════════════════════════════════════════════════════ */
+
+function RobotAvatar({ signerRef }) {
+  const group = useRef();
+  const { scene, animations } = useGLTF(MODEL_URL);
+  const { actions } = useAnimations(animations, group);
+
+  const player = useSignPlayer({ scene, actions });
+
+  // ── ملامح الوجه (Morph Targets) ────────────────────────────────────────
+  // الوجه ثمانيةُ أهدافٍ بأسماء ARKit — وهي نفسها التي يُخرجها
+  // MediaPipe FaceLandmarker، فالربط بالكاميرا لاحقاً لا يحتاج جدول ترجمة.
+  //
+  // والأسماء تُحَلّ لا تُفترَض: `pick` يقبل الاسم الحديث والقديم معاً، فنموذجٌ
+  // أقدم يحمل Happy/Sad/BlinkL/BlinkR يبقى شغّالاً دون تعديل هنا.
+  //
+  // من طرفية المتصفّح:
+  //   tarjumanFace.happy(1) / .sad(1) / .brows(1) / .brows(-1) / .mouth(0.6)
+  //   tarjumanFace.blink() / .wink('L') / .close() / .open()
+  //   tarjumanFace.apply({ jawOpen: 0.4, browInnerUp: 1 })   ← مدخل الكاميرا
+  useEffect(() => {
+    const targets = [];
+    scene.traverse((o) => {
+      if (o.isMesh && o.morphTargetDictionary && o.morphTargetInfluences) targets.push(o);
+    });
+    if (targets.length === 0) {
+      // «لا أهداف» وحدها لا تفرّق بين نموذجٍ بلا ملامح وملفٍّ خاطئ في المسار.
+      // فلتقل الرسالة ما وجدَته.
+      const seen = [];
+      scene.traverse((o) => {
+        if (o.isMesh) seen.push(`${o.name || o.type}`
+          + `[morph:${o.geometry?.morphAttributes?.position?.length ?? 0}]`);
+      });
+      console.warn(`[face] لا أهداف تشكيل في ${MODEL_URL} — الشبكات: `
+        + (seen.join(' · ') || 'لا شيء'));
+      return;
+    }
+
+    const names = [...new Set(targets.flatMap((m) => Object.keys(m.morphTargetDictionary)))];
+    const set = (name, value) => {
+      if (!name) return;
+      const v = Math.max(0, Math.min(1, Number(value) || 0));
+      targets.forEach((m) => {
+        const i = m.morphTargetDictionary[name];
+        if (i !== undefined) m.morphTargetInfluences[i] = v;
+      });
+    };
+    // الاسم الأوّل الموجود فعلاً في النموذج؛ undefined إن لم يوجد أيٌّ منها،
+    // و`set` يتجاهله بصمت — فغياب هدفٍ لا يكسر البقيّة.
+    const pick = (...cands) => cands.find((n) => names.includes(n));
+    const M = {
+      blinkL: pick('eyeBlinkLeft', 'BlinkL'),
+      blinkR: pick('eyeBlinkRight', 'BlinkR'),
+      browUp: pick('browInnerUp'),
+      browDnL: pick('browDownLeft'),
+      browDnR: pick('browDownRight'),
+      jaw:    pick('jawOpen'),
+      smile:  pick('mouthSmile', 'Happy'),
+      frown:  pick('mouthFrown', 'Sad'),
+    };
+    /* ── الرمش التلقائي ────────────────────────────────────────────────
+       المقطع Robot_Idle يحرّك العظام فقط؛ أمّا الجفون فنقودها من هنا
+       حتى يبقى توقيت الرمش عشوائيًا طبيعيًا ولا يتصادم مع Happy/Sad. */
+    const CLOSE = 90, HOLD = 45, OPEN = 170;      // ملّي ثانية
+    let raf = 0, phase = null, held = null, auto = true;
+    let nextAt = performance.now() + 1200 + Math.random() * 2500;
+
+    const eyes = (l, r) => { set(M.blinkL, l); set(M.blinkR, r); };
+    const curve = (t, hold) => {
+      if (t < CLOSE) return t / CLOSE;
+      if (t < CLOSE + hold) return 1;
+      return Math.max(0, 1 - (t - CLOSE - hold) / OPEN);
+    };
+    const fire = (l, r, hold = HOLD) => { phase = { t0: performance.now(), l, r, hold }; };
+
+    const tick = () => {
+      raf = requestAnimationFrame(tick);
+      const now = performance.now();
+      if (held) { eyes(held.l, held.r); return; }
+      if (!phase && auto && now >= nextAt) fire(1, 1);
+      if (!phase) return;
+      const t = now - phase.t0;
+      if (t >= CLOSE + phase.hold + OPEN) {
+        phase = null; eyes(0, 0);
+        nextAt = now + 1800 + Math.random() * 4200;
+      } else {
+        const w = curve(t, phase.hold);
+        eyes(w * phase.l, w * phase.r);
+      }
+    };
+    raf = requestAnimationFrame(tick);
+
+    const api = {
+      names,
+      set,
+      happy:   (v = 1) => { set(M.frown, 0); set(M.smile, v); },
+      sad:     (v = 1) => { set(M.smile, 0); set(M.frown, v); },
+      neutral: ()      => { [M.smile, M.frown, M.jaw, M.browUp, M.browDnL, M.browDnR]
+                              .forEach((n) => set(n, 0)); },
+
+      // الحاجبان على محورٍ واحد: موجبٌ يرفع الطرف الداخلي (سؤالٌ بنعم/لا)،
+      // وسالبٌ يعقدهما (سؤال استفهام). في لغة الإشارة هذا نحوٌ لا زينة.
+      brows: (v = 0) => {
+        const x = Math.max(-1, Math.min(1, Number(v) || 0));
+        set(M.browUp, Math.max(0, x));
+        set(M.browDnL, Math.max(0, -x));
+        set(M.browDnR, Math.max(0, -x));
+      },
+      // انفتاح الفم، 0 مطبق و1 مفتوح تماماً.
+      mouth: (v = 0) => set(M.jaw, v),
+
+      // مدخلٌ عامّ: كائنٌ بأسماء ARKit كما يُخرجها FaceLandmarker.
+      // ما لا يحمله النموذج يُتجاهَل، فالقائمة الكاملة (52) تمرّ بلا خطأ.
+      apply: (blendshapes) => {
+        if (!blendshapes) return;
+        for (const [k, v] of Object.entries(blendshapes)) set(pick(k), v);
+      },
+
+      // رمشة واحدة بالعينين
+      blink: () => { held = null; fire(1, 1); },
+      // غمزة: تغمض عينًا واحدة وتبقى الأخرى مفتوحة — wink('L') أو wink('R')
+      wink: (eye = 'L') => {
+        held = null;
+        const l = String(eye).toUpperCase() === 'L' ? 1 : 0;
+        fire(l, 1 - l, 260);
+      },
+      // إغماض مستمر: close() أو close('L') أو close('R')
+      close: (eye = 'both') => {
+        const e = String(eye).toUpperCase();
+        phase = null;
+        held = { l: (e === 'R' ? 0 : 1), r: (e === 'L' ? 0 : 1) };
+      },
+      // فتح العينين وإعادة الرمش التلقائي
+      open: () => { held = null; phase = null; eyes(0, 0); nextAt = performance.now() + 1200; },
+      // تشغيل/إيقاف الرمش التلقائي
+      autoBlink: (on = true) => { auto = !!on; if (!on) { phase = null; eyes(0, 0); } },
+    };
+    window.tarjumanFace = api;
+    const missing = Object.entries(M).filter(([, n]) => !n).map(([k]) => k);
+    console.log(`[face] ${names.length} هدفاً: ${names.join(', ')}`
+      + (missing.length ? `  — غير موجود: ${missing.join(', ')}` : '  — كلّها موصولة'));
+    return () => {
+      cancelAnimationFrame(raf);
+      if (window.tarjumanFace === api) delete window.tarjumanFace;
+    };
+  }, [scene]);
+
+  // ارفع المشغِّل لأعلى حتى تستطيع الواجهة إطلاق الإشارات.
+  useEffect(() => { if (signerRef) signerRef.current = player; }, [signerRef, player]);
+
+  // مقطعٌ واحد فقط يعمل: السكون.
+  //
+  // الملفّ يحوي Robot_Idle و Robot_Talk. والثاني لا يُشغَّل إطلاقاً — ليس
+  // للروبوت ما يقوله، وتشغيله يجعله يثرثر بلا مناسبة. يُوقَف صراحةً ويُصفَّر
+  // وزنه، فلا يكتب في الهيكل ولو أيقظه شيءٌ لاحقاً.
+  useEffect(() => {
+    if (!actions || Object.keys(actions).length === 0) return;
+    const keys = Object.keys(actions);
+
+    const idleKey =
+      keys.find((k) => k.toLowerCase().includes('idle')) ||
+      keys.find((k) => k.toLowerCase().includes('stand')) ||
+      keys.find((k) => k.toLowerCase().includes('rest')) ||
+      keys[0];
+
+    keys.forEach((k) => {
+      const a = actions[k];
+      if (!a) return;
+      a.stop();
+      if (k !== idleKey) { a.enabled = false; a.setEffectiveWeight(0); }
+    });
+
+    if (idleKey && actions[idleKey]) {
+      actions[idleKey].enabled = true;
+      actions[idleKey].setEffectiveWeight(1);
+      actions[idleKey].reset().fadeIn(0.3).play();
+    }
+    console.log(`[robot] idle clip: ${idleKey}  `
+      + `(idle only; ${keys.filter((k) => k !== idleKey).join(', ') || 'none'} disabled)`);
+
+    return () => { if (idleKey && actions[idleKey]) actions[idleKey].fadeOut(0.3); };
+  }, [actions]);
+
+  // يجب أن يعمل مشغِّل الإشارات بعد مازج الحركات في كل إطار، وإلّا كتب مقطع
+  // السكون فوق الوضعية التي طبّقناها للتوّ.
+  useFrame((_, delta) => player.update(delta));
+
+  /* ── تأطير المسرح ────────────────────────────────────────────────────
+     الأرقام السابقة (scale 0.7، y -0.3) كانت لهيكلٍ ارتفاعه 1.75 وحدة.
+     وهيكل `last.glb` الحالي مُطبَّعٌ على متر واحد، فكان يظهر بثلثَي حجمه
+     في أسفل الإطار.
+
+     والتأطير هنا ليس ملءَ الشاشة بالجسد، بل إظهارُ فضاء الإشارة: لغة
+     الإشارة تُؤدّى بين الخصر وما فوق الرأس بقليل، فحُسبت الحدود من الهيكل
+     نفسه — أخفض وضعٍ للكفّ عند 0.42 من ارتفاع الجسم، وأعلى طرفِ إصبعٍ في
+     وضع الجبهة عند 1.15 — ثمّ وُضع هذا المدى في مجال الرؤية الرأسي
+     (‏±0.828 وحدة على بُعد 2.05 بزاوية 44°) مع هامش. والرجلان تُقطعان
+     عند الفخذ عمداً: لا معنى فيهما، وإبقاؤهما يُصغِّر الكفّين إلى نصف
+     حجمهما — والكفّان هما الكلام.
+
+     قِيس أعرضُ وضعٍ (ذراعان مبسوطتان إلى الجنبين) فبقي داخل الإطار حتى
+     في أضيق نسبة عرضٍ يبلغها العمود. */
+  return (
+    <group ref={group} position={[0, -0.90, 0]} scale={1.85}>
+      <primitive object={scene} />
+    </group>
+  );
+}
+
+/* ═══ حدود البُعد البؤري ══════════════════════════════════════════════════
+   FOV_MIN → تكبيرٌ أقصى (telephoto — وجهٌ مقرَّب جداً).
+   FOV_DEFAULT → الإطار الافتراضي (فضاء الإشارة كاملاً).
+   FOV_MAX → زاوية واسعة (wide — يظهر الجسم بأكمله مع هامش). */
+const FOV_MIN     = 12;
+const FOV_DEFAULT = 44;
+const FOV_MAX     = 85;
+
+// يوجِّه الكاميرا معامدة لمستوى العينين والوجه لتكون النظرة مستقيمة ومباشرة للكاميرا
+function CameraSetup() {
+  const { camera } = useThree();
+  useEffect(() => {
+    camera.position.set(0, 0.60, 2.05);
+    camera.lookAt(0, 0.60, 0);
+    camera.fov = FOV_DEFAULT;
+    camera.updateProjectionMatrix();
+  }, [camera]);
+  return null;
+}
+
+/**
+ * ZoomController — يتحكّم في البُعد البؤري (FOV) بالسكرول واللمس.
+ *
+ * لماذا FOV لا dolly ؟
+ * OrbitControls يحرّك الكاميرا للأمام/للخلف (dolly) وهذا يُشوِّه النسب.
+ * تغيير FOV يحاكي عدسة الكاميرا الحقيقية: الجسم يكبر/يصغر بلا تشويه.
+ *
+ * السكرول للأعلى (أو ضمّ الأصابع) → تكبير (FOV أصغر).
+ * السكرول للأسفل (أو فتح الأصابع) → تصغير (FOV أكبر).
+ */
+function ZoomController({ onFovChange }) {
+  const { camera, gl } = useThree();
+
+  useEffect(() => {
+    const canvas = gl.domElement;
+    let pinchDist0 = null;
+
+    /* ── سكرول الماوس ───────────────────────────────────────────────── */
+    const onWheel = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      // deltaY موجبٌ للأسفل → نريد تصغيراً → FOV أكبر
+      const delta = e.deltaY * 0.04;
+      camera.fov = Math.max(FOV_MIN, Math.min(FOV_MAX, camera.fov + delta));
+      camera.updateProjectionMatrix();
+      onFovChange?.(camera.fov);
+    };
+
+    /* ── إيماءة القرص باصبعين (pinch) ────────────────────────────────── */
+    const pinchDist = (touches) => {
+      const dx = touches[0].clientX - touches[1].clientX;
+      const dy = touches[0].clientY - touches[1].clientY;
+      return Math.sqrt(dx * dx + dy * dy);
+    };
+
+    const onTouchStart = (e) => {
+      if (e.touches.length === 2) pinchDist0 = pinchDist(e.touches);
+    };
+
+    const onTouchMove = (e) => {
+      if (e.touches.length !== 2 || pinchDist0 === null) return;
+      e.preventDefault();
+      const d = pinchDist(e.touches);
+      // انضغاط (d أصغر) → تكبير → FOV يصغر
+      const delta = (pinchDist0 - d) * 0.12;
+      camera.fov = Math.max(FOV_MIN, Math.min(FOV_MAX, camera.fov + delta));
+      camera.updateProjectionMatrix();
+      onFovChange?.(camera.fov);
+      pinchDist0 = d;
+    };
+
+    const onTouchEnd = (e) => {
+      if (e.touches.length < 2) pinchDist0 = null;
+    };
+
+    canvas.addEventListener('wheel',        onWheel,      { passive: false });
+    canvas.addEventListener('touchstart',   onTouchStart, { passive: true  });
+    canvas.addEventListener('touchmove',    onTouchMove,  { passive: false });
+    canvas.addEventListener('touchend',     onTouchEnd,   { passive: true  });
+
+    return () => {
+      canvas.removeEventListener('wheel',        onWheel);
+      canvas.removeEventListener('touchstart',   onTouchStart);
+      canvas.removeEventListener('touchmove',    onTouchMove);
+      canvas.removeEventListener('touchend',     onTouchEnd);
+    };
+  }, [camera, gl, onFovChange]);
+
+  return null;
+}
+
+const RobotCanvas = React.memo(function RobotCanvas({ signerRef, onFovChange }) {
+  return (
+    <Canvas
+      className="!absolute inset-0 w-full h-full"
+      camera={{ position: [0, 0.60, 2.05], fov: FOV_DEFAULT }}
+    >
+      <CameraSetup />
+      <ZoomController onFovChange={onFovChange} />
+      {/* إضاءة متوازنة تبرز تفاصيل الثوب وحركات اليدين وملامح الوجه */}
+      <ambientLight intensity={0.9} />
+      <directionalLight position={[0, 4, 4]} intensity={1.0} />
+      <directionalLight position={[-4, 2, 2]} intensity={0.5} />
+      <directionalLight position={[4, 2, 2]} intensity={0.5} />
+      <Suspense fallback={null}>
+        <RobotAvatar signerRef={signerRef} />
+      </Suspense>
+      {/* enableZoom=false لأنّ ZoomController يتولّى التحكّم بالبُعد البؤري */}
+      <OrbitControls target={[0, 0.60, 0]} makeDefault enablePan={true} enableZoom={false} minDistance={0.5} maxDistance={10} />
+    </Canvas>
+  );
+});
+
+/* ═══ المسرح ════════════════════════════════════════════════════════════ */
+
+/**
+ * RobotStage — الروبوت، ومعاينة المستخدم لنفسه، وحالة الالتقاط.
+ *
+ * ارتفاعه يملأ ما يتبقّى من العمود على الشاشات العريضة، ويُقاس بـdvh على
+ * الضيّقة (لا vh — فشريط عنوان المتصفّح المتقلّص يترك فجوة قافزة).
+ */
+/**
+ * RobotStage — الروبوت، ومعاينة المستخدم لنفسه، وحالة الالتقاط.
+ *
+ * المعاينة ليست زينة: المستخدم الأصمّ يشير بيديه، وبدون أن يرى نفسه لا يعرف
+ * أهو داخل الإطار أصلاً أم لا. وإطارها يحمر أثناء الالتقاط، فيرى بعينه أنّ
+ * إشارته تُسجَّل الآن.
+ */
+export default function RobotStage({ signerRef, cameraOn, capturing, previewUrl, handsVisible }) {
+  const [fov, setFov] = useState(FOV_DEFAULT);
+
+  // نسبة الزوم من 0 (واسع) إلى 1 (مكبَّر) لعرضها في شريط المؤشّر
+  const zoomRatio = (FOV_MAX - fov) / (FOV_MAX - FOV_MIN);
+
+  return (
+    <div
+      className="cq relative rounded-card border border-hair bg-surface overflow-clip
+                 shadow-card isolate flex-1 min-h-0 w-full h-full min-h-[22rem]"
+    >
+      {/* بقعتا لونٍ باهتتان وضجيجٌ خفيف فوقهما — عمقٌ بلا حدٍّ مرئي ولا اتجاه
+          يسحب العين، ويمنع الضجيجُ التشريطَ على الشاشات ذات الثماني بتّات. */}
+      <div aria-hidden="true" className="stage-field absolute inset-0" />
+
+      {/* ظلّ أرضي يربط الروبوت بالسطح بدل أن يطفو في فراغ */}
+      <div
+        aria-hidden="true"
+        className="absolute bottom-[5%] left-1/2 -translate-x-1/2 w-[35%] h-6
+                   rounded-[50%] bg-ink/8 blur-xl pointer-events-none"
+      />
+
+      <RobotCanvas signerRef={signerRef} onFovChange={setFov} />
+
+      {/* ── مؤشّر البُعد البؤري (FOV) ─────────────────────────────────────
+          يظهر أسفل اليمين دائماً. شريطٌ رأسي: مكبَّر في الأعلى، واسع في
+          الأسفل — مثل أسطوانة العدسة الحقيقية. */}
+      <div
+        title={`بُعد بؤري: ${Math.round(fov)}°  (السكرول أو قرص الأصابع للتحكّم)`}
+        className="absolute bottom-4 right-4 flex flex-col items-center gap-1
+                   bg-surface/80 backdrop-blur-sm border border-hair rounded-chip
+                   px-2 py-2 pointer-events-none select-none"
+        aria-label={`مستوى الزوم ${Math.round(zoomRatio * 100)}٪`}
+      >
+        {/* أيقونة الكاميرا */}
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
+             stroke="currentColor" strokeWidth="2" strokeLinecap="round"
+             strokeLinejoin="round" className="text-ink-3">
+          <path d="M23 7l-7 5 7 5V7z"/>
+          <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
+        </svg>
+
+        {/* شريط الزوم الرأسي */}
+        <div className="relative w-1.5 h-14 rounded-full bg-hair overflow-hidden">
+          <div
+            className="absolute bottom-0 left-0 right-0 rounded-full
+                       bg-gradient-to-t from-accent to-accent/60
+                       transition-all duration-100"
+            style={{ height: `${zoomRatio * 100}%` }}
+          />
+        </div>
+
+        {/* قيمة FOV بالدرجات */}
+        <span className="text-2xs font-mono text-ink-3 leading-none">
+          {Math.round(fov)}°
+        </span>
+      </div>
+
+      {/* شارة الالتقاط — أعلى المسرح، حيث ينظر المستخدم وهو يشير */}
+      {cameraOn && (
+        <div
+          className={`absolute top-4 right-4 flex items-center gap-2 h-8 px-3 rounded-chip
+                      border text-sm font-medium transition-colors
+            ${capturing ? 'bg-live-wash/90 border-live/30 text-live'
+              : 'bg-surface/85 border-hair text-ink-3'}`}
+          aria-live="polite"
+        >
+          <span className={`size-2 rounded-full ${capturing ? 'bg-live animate-pulse' : 'bg-ink-3/50'}`} />
+          {capturing ? 'جارٍ تسجيل الإشارة' : 'بانتظار إشارتك'}
+        </div>
+      )}
+
+      {/* معاينة ذاتية — المستخدم الأصمّ يشير بيديه، وبدون أن يرى نفسه لا
+          يعرف أهو داخل الإطار أصلاً. عرضها نسبةٌ من المسرح لا رقمٌ ثابت،
+          و4:3 محجوزة سلفاً فلا يقفز التخطيط عند وصول أوّل إطار. */}
+      {cameraOn && (
+        <figure
+          className={`absolute bottom-4 left-4 w-[clamp(8.5rem,24cqi,12rem)] rounded-ctl
+                      overflow-clip bg-ink shadow-pop outline outline-2 transition-colors
+            ${capturing ? 'outline-live' : 'outline-white/70'}`}
+        >
+          {previewUrl ? (
+            <img
+              src={previewUrl}
+              alt="معاينة الكاميرا"
+              width="320"
+              height="240"
+              className="block w-full aspect-[4/3] object-cover"
+            />
+          ) : (
+            <div className="w-full aspect-[4/3] flex items-center justify-center text-sm text-white/50">
+              جارٍ تشغيل الكاميرا…
+            </div>
+          )}
+
+          <figcaption
+            className="absolute top-1.5 right-1.5 flex items-center gap-1.5
+                       bg-ink/70 px-2 h-5 rounded-full backdrop-blur-sm"
+          >
+            <span className={`size-1.5 rounded-full ${handsVisible ? 'bg-good' : 'bg-white/40'}`} />
+            <span className="text-2xs text-white/90">
+              {handsVisible ? 'تم رصد اليد' : 'لا توجد يد'}
+            </span>
+          </figcaption>
+        </figure>
+      )}
+
+      {/* الحالة الفارغة — قبل تشغيل الكاميرا */}
+      {!cameraOn && (
+        /* أعلى اليمين، في نفس موضع شارة الالتقاط — فالعين تتعلّم أن حالة
+           المسرح تُقرأ من هناك دائماً. وكان موضعها السابق أسفل الوسط، فوق
+           قدمَي الروبوت تماماً. */
+        <p
+          className="absolute top-4 right-4 max-w-[min(calc(100%-2rem),22rem)]
+                     text-sm text-ink-3 text-pretty bg-surface/85 backdrop-blur-sm
+                     px-3 py-1.5 min-h-8 flex items-center rounded-chip border border-hair"
+        >
+          شغِّل الكاميرا لتبدأ الترجمة، أو اكتب كلمة ليؤدّيها الروبوت
+        </p>
+      )}
+    </div>
+  );
+}
+
+useGLTF.preload(MODEL_URL);

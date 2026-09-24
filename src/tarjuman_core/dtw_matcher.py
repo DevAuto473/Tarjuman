@@ -156,6 +156,9 @@ class SignReferenceLibrary:
 
     def __init__(self):
         self.references: dict[str, np.ndarray] = {}
+        # موضع التسجيلة الوسيطة داخل تسجيلات تسميتها، بترتيب الملفّ.
+        # يحتاجه المصدِّر ليأخذ مدّتها هي لا متوسّط المدد.
+        self.medoid_index: dict[str, int] = {}
 
     # -- Construction --------------------------------------------------------
 
@@ -176,29 +179,25 @@ class SignReferenceLibrary:
 
         by_label: dict[str, list[np.ndarray]] = {}
 
-        with open(path, "r", newline="", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            next(reader, None)                       # header
-            for row in reader:
-                if not row or len(row) != TOTAL_FEATURES + 1:
-                    continue
-                label = row[0]
-                try:
-                    values = np.asarray(row[1:], dtype=np.float32)
-                except ValueError:
-                    continue
+        # تُحدَّد كتلة السمات بالاسم لا بالموضع: أعمدة الوصف في مقدّمة الملفّ
+        # (signer، camera، …) كانت تجعل كلّ صفّ يُرفَض لأن طوله لم يعد
+        # TOTAL_FEATURES + 1، فتُحمَّل صفر مراجع ويصبح وضع التدرّب بلا مرجع.
+        from tarjuman_core.dataset import iter_samples
 
-                # A CSV row is [per-frame block | global block]. DTW compares
-                # pose trajectories frame by frame, so only the per-frame block
-                # is reshapeable — the globals (duration, tempo, direction) are
-                # whole-gesture summaries with no time axis and belong to the
-                # classifier, not to this comparison.
-                by_label.setdefault(label, []).append(
-                    values[:FRAME_FEATURES].reshape(SEQUENCE_LENGTH, VALS_PER_FRAME)
-                )
+        for label, values in iter_samples(path):
+            # A CSV row is [per-frame block | global block]. DTW compares
+            # pose trajectories frame by frame, so only the per-frame block
+            # is reshapeable — the globals (duration, tempo, direction) are
+            # whole-gesture summaries with no time axis and belong to the
+            # classifier, not to this comparison.
+            by_label.setdefault(label, []).append(
+                values[:FRAME_FEATURES].reshape(SEQUENCE_LENGTH, VALS_PER_FRAME)
+            )
 
         for label, samples in by_label.items():
-            lib.references[label] = _medoid(samples)
+            index = _medoid_index(samples)
+            lib.medoid_index[label] = index
+            lib.references[label] = samples[index]
 
         print(f"[OK]  DTW references loaded: {len(lib.references)} sign(s) "
               f"from {os.path.basename(path)}")
@@ -243,6 +242,17 @@ class SignReferenceLibrary:
     @property
     def labels(self) -> list[str]:
         return sorted(self.references)
+
+
+def _medoid_index(samples: list[np.ndarray]) -> int:
+    """موضع العيّنة الوسيطة، لا العيّنة نفسها — ليعرف المصدِّر أيَّها اختيرت."""
+    if len(samples) == 1:
+        return 0
+    totals = [
+        sum(dtw_distance(s, other) for j, other in enumerate(samples) if j != i)
+        for i, s in enumerate(samples)
+    ]
+    return int(np.argmin(totals))
 
 
 def _medoid(samples: list[np.ndarray]) -> np.ndarray:

@@ -1,0 +1,325 @@
+/**
+ * poses.js — reusable hand shapes for the Tarjuman robot
+ * =======================================================
+ * Bone names come straight from the rig inside Tarjuman_Signer.glb
+ * (skin "Tarjuman_Rig", 54 joints, standard Blender .L/.R naming).
+ *
+ * Why a pose LIBRARY instead of one animation per word
+ * ----------------------------------------------------
+ * Sign language reuses a small set of hand shapes over and over — a fist, a
+ * flat palm, a pointing index. Authoring a separate Blender animation per word
+ * would re-model those same shapes hundreds of times. Here each shape is
+ * defined ONCE as data, and a word becomes "hand shape X carried along arm
+ * path Y". Adding a word is then a few lines of JSON, not a modelling session.
+ *
+ * Rotation convention
+ * -------------------
+ * Every value is [x, y, z] Euler angles in DEGREES, applied in the bone's own
+ * local space, relative to its rest pose. Degrees (not radians) because these
+ * numbers are meant to be hand-tuned by a human.
+ *
+ * ⚠️  انحناءات الأصابع أدناه تقديرات، تُضبط بالعين من لوحة المعايرة.
+ *     أمّا زوايا الذراع فلم تعد كذلك: حُلَّت عددياً على هذا الهيكل بعينه
+ *     (انظر ARM_POSITIONS). محاور عظام Blender اعتباطية، ولهذا كان الحلّ
+ *     العددي هو السبيل الوحيد إلى أرقام صحيحة.
+ */
+
+// ── Bone name constants ──────────────────────────────────────────────────────
+// Centralised so a rig rename breaks in ONE place instead of silently
+// producing a robot that simply never moves.
+export const BONES = {
+  root: 'Root',
+  hips: 'Hips',
+  spine: 'Spine',
+  chest: 'Chest',
+  neck: 'Neck',
+  head: 'Head',
+  jaw: 'Jaw',
+  shoulder: (s) => `Shoulder.${s}`,
+  upperArm: (s) => `UpperArm.${s}`,
+  lowerArm: (s) => `LowerArm.${s}`,
+  hand: (s) => `Hand.${s}`,
+  finger: (name, seg, s) => `${name}.0${seg}.${s}`,
+};
+
+export const FINGERS = ['thumb', 'index', 'middle', 'ring', 'pinky'];
+export const SIDES = ['L', 'R'];
+
+/* وضعيّتا الكفّ: مفتوح ومقبوض — أربعة أرقام (w,x,y,z) لكل سلامية.
+ *
+ * لماذا وضعيّتان لا زاوية واحدة
+ * -----------------------------
+ * وضعية السكون في هذا الهيكل ليست كفّاً مبسوطاً: الأصابع فيها منفرجة ومنحنية
+ * قليلاً. فكان «انثناء صفر» يعني «اتركها كما وُلدت» لا «افردها»، ولهذا كان
+ * الكفّ المفتوح يخرج مفرّج الأصابع نصف مقبوض.
+ *
+ * الآن الطرفان محسوبان عددياً على الهيكل نفسه:
+ *   • المفتوح: حُلّ لكل سلامية دورانٌ يوجّهها إلى امتداد الكفّ (محور اليد
+ *     الطولي) مع تفريجٍ جانبي صغير متدرّج (سبّابة ‑0.03 … خنصر +0.12 من
+ *     خطّ المفاصل)، بالتسلسل من المفصل إلى الطرف. والإبهام إلى جانب الكفّ
+ *     مع ميلٍ خفيف خارج مستواه.
+ *   • المقبوض: مبنيّ على تشريح القبضة لا على تخمين زاوية — السلامية الأولى
+ *     تدور ٩٠° فتصير عموديّة على الكفّ، والثانية ١٠٢° فترجع نحو الرسغ،
+ *     والثالثة ٧٢° فتغوص في الكفّ. المجموع ~٢٦٤°، وهو ما يجعل أطراف
+ *     الأصابع تلامس الكفّ (قِيس: ١–٥ مم فوق مستواه). وكان المجموع ٢٢٠°
+ *     فتبقى الأطراف ١٣–١٦ مم في الهواء — «مخلب» لا قبضة.
+ *     والإبهام محلولٌ باتّجاهات صريحة: يعبُر فوق السلاميات الوسطى كما في
+ *     القبضة الحقيقية، لا ينثني في مستواه.
+ *
+ * وما بينهما slerp حقيقي، لا ضربٌ في نسبة: ضربُ زوايا أويلر يغيّر المحور
+ * في المنتصف، فتلتوي الأصابع في الطريق.
+ */
+const HAND_OPEN = {
+  'thumb.01.R': [  0.93204,  -0.34723,   0.00000,   0.10357],
+  'thumb.02.R': [  0.99793,   0.06411,  -0.00000,   0.00553],
+  'thumb.03.R': [  0.91932,  -0.39125,   0.00000,   0.04203],
+  'index.01.R': [  0.96510,   0.02745,   0.00000,  -0.26045],
+  'index.02.R': [  0.98413,  -0.17038,   0.00000,  -0.04958],
+  'index.03.R': [  0.95905,  -0.27489,  -0.00000,   0.06820],
+  'middle.01.R': [  0.96299,  -0.10183,   0.00000,  -0.24958],
+  'middle.02.R': [  0.96004,  -0.26903,  -0.00000,  -0.07708],
+  'middle.03.R': [  0.96755,   0.06265,   0.00000,  -0.24480],
+  'ring.01.R': [  0.93037,  -0.21611,   0.00000,  -0.29616],
+  'ring.02.R': [  0.91794,  -0.39422,   0.00000,  -0.04447],
+  'ring.03.R': [  0.99381,  -0.11026,   0.00000,   0.01328],
+  'pinky.01.R': [  0.88986,  -0.28772,   0.00000,  -0.35406],
+  'pinky.02.R': [  0.93883,  -0.33278,   0.00000,  -0.08861],
+  'pinky.03.R': [  0.91072,  -0.19040,  -0.00000,   0.36651],
+  'thumb.01.L': [  0.97199,  -0.17989,   0.00000,  -0.15121],
+  'thumb.02.L': [  0.99491,   0.09619,   0.00000,  -0.02988],
+  'thumb.03.L': [  0.73407,  -0.64511,  -0.00000,  -0.21208],
+  'index.01.L': [  0.96784,  -0.11636,   0.00000,   0.22302],
+  'index.02.L': [  0.99843,  -0.04927,  -0.00000,  -0.02674],
+  'index.03.L': [  0.96800,  -0.24827,  -0.00000,  -0.03653],
+  'middle.01.L': [  0.98469,  -0.10612,  -0.00000,   0.13831],
+  'middle.02.L': [  0.96468,  -0.25050,   0.00000,   0.08152],
+  'middle.03.L': [  0.98384,  -0.07323,   0.00000,   0.16338],
+  'ring.01.L': [  0.97698,  -0.14976,   0.00000,   0.15192],
+  'ring.02.L': [  0.93848,  -0.31565,   0.00000,   0.14008],
+  'ring.03.L': [  0.94093,  -0.32969,  -0.00000,  -0.07715],
+  'pinky.01.L': [  0.98474,  -0.08710,   0.00000,   0.15064],
+  'pinky.02.L': [  0.96684,  -0.12906,  -0.00000,   0.22038],
+  'pinky.03.L': [  0.97353,  -0.21465,  -0.00000,  -0.07848],
+};
+
+const HAND_FIST = {
+  'thumb.01.R': [  0.65973,   0.73252,  -0.00000,   0.16784],
+  'thumb.02.R': [  0.96410,   0.24744,  -0.00000,  -0.09637],
+  'thumb.03.R': [  0.96526,  -0.26126,  -0.00000,  -0.00400],
+  'index.01.R': [  0.83349,   0.34857,  -0.12436,   0.41028],
+  'index.02.R': [  0.74516,   0.47453,   0.03690,   0.46712],
+  'index.03.R': [  0.91186,   0.30374,   0.08164,   0.26380],
+  'middle.01.R': [  0.87029,   0.25624,  -0.01861,   0.42023],
+  'middle.02.R': [  0.81183,   0.45469,   0.06807,   0.35994],
+  'middle.03.R': [  0.80900,   0.56871,  -0.14359,   0.03825],
+  'ring.01.R': [  0.91667,   0.25735,   0.03018,   0.30427],
+  'ring.02.R': [  0.88473,   0.45405,   0.06099,   0.08580],
+  'ring.03.R': [  0.86877,   0.49365,   0.03928,   0.00409],
+  'pinky.01.R': [  0.94593,   0.28774,   0.03110,   0.14645],
+  'pinky.02.R': [  0.84733,   0.52310,   0.02139,  -0.08907],
+  'pinky.03.R': [  0.95751,   0.23258,   0.16271,  -0.05109],
+  'thumb.01.L': [  0.55196,   0.82488,   0.00000,   0.12213],
+  'thumb.02.L': [  0.95937,   0.26836,   0.00000,   0.08709],
+  'thumb.03.L': [  0.81586,  -0.56103,   0.00000,  -0.14006],
+  'index.01.L': [  0.84162,   0.41734,   0.21857,  -0.26406],
+  'index.02.L': [  0.64544,   0.57251,   0.12472,  -0.48998],
+  'index.03.L': [  0.90616,   0.31542,   0.04488,  -0.27816],
+  'middle.01.L': [  0.81731,   0.29386,   0.12033,  -0.48081],
+  'middle.02.L': [  0.80347,   0.46456,   0.09242,  -0.36065],
+  'middle.03.L': [  0.86007,   0.47459,   0.18659,  -0.01474],
+  'ring.01.L': [  0.83822,   0.27212,   0.06708,  -0.46780],
+  'ring.02.L': [  0.85520,   0.47399,   0.12435,  -0.16882],
+  'ring.03.L': [  0.95841,   0.27612,   0.06857,   0.02266],
+  'pinky.01.L': [  0.81912,   0.28043,   0.04417,  -0.49846],
+  'pinky.02.L': [  0.77596,   0.57377,   0.15318,  -0.21262],
+  'pinky.03.L': [  0.89983,   0.38551,  -0.03720,  -0.20077],
+};
+
+/** slerp بين وضعيّتين ثمّ تحويلٌ إلى أويلر XYZ بترتيب three.js (R = Rx·Ry·Rz). */
+function slerpToEulerDeg(a, b, t) {
+  let [aw, ax, ay, az] = a;
+  let [bw, bx, by, bz] = b;
+  let dot = aw * bw + ax * bx + ay * by + az * bz;
+  if (dot < 0) { bw = -bw; bx = -bx; by = -by; bz = -bz; dot = -dot; }
+
+  let w, x, y, z;
+  if (dot > 0.9995) {
+    w = aw + (bw - aw) * t; x = ax + (bx - ax) * t;
+    y = ay + (by - ay) * t; z = az + (bz - az) * t;
+  } else {
+    const th = Math.acos(Math.min(1, dot)), s = Math.sin(th);
+    const k0 = Math.sin((1 - t) * th) / s, k1 = Math.sin(t * th) / s;
+    w = aw * k0 + bw * k1; x = ax * k0 + bx * k1;
+    y = ay * k0 + by * k1; z = az * k0 + bz * k1;
+  }
+  const n = Math.hypot(w, x, y, z) || 1;
+  w /= n; x /= n; y /= n; z /= n;
+
+  const xx = x * x, yy = y * y, zz = z * z;
+  const xy = x * y, xz = x * z, yz = y * z;
+  const wx = w * x, wy = w * y, wz = w * z;
+  const m00 = 1 - 2 * (yy + zz), m01 = 2 * (xy - wz), m02 = 2 * (xz + wy);
+  const m11 = 1 - 2 * (xx + zz), m12 = 2 * (yz - wx);
+  const m21 = 2 * (yz + wx),     m22 = 1 - 2 * (xx + yy);
+
+  const D = 180 / Math.PI;
+  const ey = Math.asin(Math.max(-1, Math.min(1, m02)));
+  let ex, ez;
+  if (Math.abs(m02) < 0.9999999) {
+    ex = Math.atan2(-m12, m22);
+    ez = Math.atan2(-m01, m00);
+  } else {
+    ex = Math.atan2(m21, m11);
+    ez = 0;
+  }
+  return [ex * D, ey * D, ez * D];
+}
+
+/**
+ * Build the finger-bone rotations for one hand from a per-finger curl amount.
+ *
+ * @param {Object} curls  e.g. { index: 0, middle: 1, thumb: 0.5 }
+ *                        0 = كفّ مبسوط تماماً، 1 = مقبوض تماماً
+ * @param {string} side   'L' or 'R'
+ */
+export function fingerPose(curls, side) {
+  const pose = {};
+  for (const finger of FINGERS) {
+    const curl = Math.max(0, Math.min(1, curls[finger] ?? 0));
+    for (let seg = 1; seg <= 3; seg++) {
+      const name = BONES.finger(finger, seg, side);
+      const o = HAND_OPEN[name], f = HAND_FIST[name];
+      pose[name] = (o && f) ? slerpToEulerDeg(o, f, curl) : [0, 0, 0];
+    }
+  }
+  return pose;
+}
+
+// ── Hand shape library ───────────────────────────────────────────────────────
+// Curl amounts per finger: 0 = straight, 1 = fully closed.
+export const HAND_SHAPES = {
+  flat:    { thumb: 0.0, index: 0.0, middle: 0.0, ring: 0.0, pinky: 0.0 },
+  fist:    { thumb: 0.9, index: 1.0, middle: 1.0, ring: 1.0, pinky: 1.0 },
+  point:   { thumb: 0.8, index: 0.0, middle: 1.0, ring: 1.0, pinky: 1.0 },
+  peace:   { thumb: 0.9, index: 0.0, middle: 0.0, ring: 1.0, pinky: 1.0 },
+  thumbUp: { thumb: 0.0, index: 1.0, middle: 1.0, ring: 1.0, pinky: 1.0 },
+  pinch:   { thumb: 0.5, index: 0.5, middle: 1.0, ring: 1.0, pinky: 1.0 },
+  cup:     { thumb: 0.4, index: 0.4, middle: 0.4, ring: 0.4, pinky: 0.4 },
+  open5:   { thumb: 0.1, index: 0.1, middle: 0.1, ring: 0.1, pinky: 0.1 },
+};
+
+/** Convenience: full finger rotation map for a named shape. */
+export function handShape(shapeName, side) {
+  const curls = HAND_SHAPES[shapeName];
+  if (!curls) {
+    console.warn(`[signing] unknown hand shape: ${shapeName}`);
+    return {};
+  }
+  return fingerPose(curls, side);
+}
+
+// ── Arm positions ───────────────────────────────────────────────────
+// أين تقف اليد في الفضاء. لغة الإشارة شديدة الاعتماد على الموضع (الصدر مقابل
+// الوجه مقابل الفضاء المحايد)، فالتسمية بالموضع لا بالزاوية.
+//
+// من أين جاءت هذه الأرقام  —  حُلَّت من جديد على Tarjuman_Signer.glb
+// ------------------------------------------------------------------
+// الهيكل تبدّل: كان `TarjumanRobot2.glb` (‏57 مفصلاً، ارتفاع ~3.3 وحدة،
+// وضعية ارتباط T-pose)، وصار `Tarjuman_Rig` داخل `Tarjuman_Signer.glb`
+// (‏54 مفصلاً، ارتفاع 1.0 متر، ووضعية السكون ذراعان مسترخيتان إلى الجنبين).
+// الأرقام القديمة كانت تخصّ الهيكل الأوّل، فكانت تُخرج الذراعين إلى الأمام
+// في كل موضع وتقلب الكفّ — وهذا ما كان يُرى في الواجهة.
+//
+// الحلّ الجديد: قِيس الجسم من الشبكة نفسها (الصدر z≈0.74‑0.80، الذقن z≈0.86،
+// الجبهة z≈0.94، مقدّمة الوجه y≈‑0.076)، ثمّ لكل موضع هدفٌ للرسغ أمام ذلك
+// السطح، وحُلَّت ذراعٌ بعظمتين (IK) تصل إليه ومرفقٌ موجَّه إلى الأسفل والخلف،
+// ثمّ حُوّل الحلّ إلى إزاحات أويلر (XYZ، درجات) عن وضعية السكون — وهي نفسها
+// ما يضربه المشغِّل فوق `neutral`. خطأ الوصول 0.00 مم في المواضع العشرة.
+//
+// والرسغ حُلَّ معها: يُبنى إطارٌ متعامد من (اتّجاه الأصابع، عموديّ الكفّ)
+// ويُقارَن بإطار السكون، فيخرج الكفّ متّجهاً إلى الأمام والأصابع إلى أعلى في
+// كل موضع. وعموديّ الكفّ يُقاس من الهيكل نفسه: cross(index.01, pinky.01)،
+// وهو على هذا الهيكل ظهرُ اليد في اليمنى والكفُّ في اليسرى — ولذلك تُقلب
+// إشارته لليمنى، لا مرآةٌ حسابية.
+//
+// اليمين واليسار غير متماثلين عمداً: وضعية السكون نفسها غير متماثلة
+// (Shoulder.L و Shoulder.R يحملان دورانين مختلفين)، فالمرآة كانت ستُنتج
+// ذراعاً يسرى مزحزحة.
+//
+// ⚠️  إن استُبدل ملفّ الهيكل مرّة أخرى، أعِد الحلّ — هذه الأرقام تخصّ
+//     `Tarjuman_Rig` وحده. ولوحة المعايرة تبقى الطريق لضبطها بالعين.
+const ARM_SOLVED = {
+  chest:    { R: { u: [ -22.6,   1.8,   8.8], l: [-103.0, -13.7, -67.9], h: [  -0.9,  36.1, -26.7] },
+              L: { u: [ -16.7,  -1.0,  -6.6], l: [-109.9,  15.7,  55.6], h: [   6.0, -35.7,  21.7] } },
+  face:     { R: { u: [ -47.4,   5.0,  11.3], l: [ -98.7,  -7.5, -74.5], h: [   4.9,  34.3,  -6.4] },
+              L: { u: [ -43.2,  -4.1, -10.3], l: [-104.5,  11.2,  62.4], h: [  17.5, -30.9,  -1.7] } },
+  forehead: { R: { u: [ -70.0,   9.2,  13.2], l: [ -95.6,  -1.1, -87.3], h: [   6.0,  25.4,   9.7] },
+              L: { u: [ -67.4,  -8.7, -13.1], l: [ -99.1,   6.1,  76.8], h: [  20.2, -17.2, -16.9] } },
+  outward:  { R: { u: [ -31.8,  -3.3, -11.6], l: [ -71.4,  10.1, -47.9], h: [ -16.0,  20.2, -54.3] },
+              L: { u: [ -26.0,   3.1,  13.3], l: [ -75.0,  -3.4,  39.5], h: [ -16.0, -20.5,  48.4] } },
+  side:     { R: { u: [  -1.4,  -0.4, -33.1], l: [ -70.2, -30.2, -34.1], h: [ -24.1,   4.7, -40.8] },
+              L: { u: [   2.7,  -0.9,  34.6], l: [ -76.3,  34.9,  22.9], h: [ -23.2,  -3.1,  33.4] } },
+};
+
+// ملاحظة على لفّة الرسغ: 65٪ منها نُقلت إلى الساعد (دوران حول محوره الطولي،
+// وهو ما يفعله الساعد الحقيقي: كبٌّ وبسط). الرسغ وحده كان يلتوي 78°–102°
+// فينفتق الكُمّ عند المعصم وتبدو اليد مخلوعة. الموضع النهائي للكفّ لم يتغيّر.
+
+/** يبني خريطة العظام لموضعٍ محلول. */
+function solvedArm(name) {
+  return (side) => {
+    const a = ARM_SOLVED[name][side];
+    return {
+      // الكتف يبقى في وضعية السكون: تدويره يزحزح مفصل الكتف عن مكانه في الجسم.
+      [BONES.shoulder(side)]: [0, 0, 0],
+      [BONES.upperArm(side)]: a.u,
+      [BONES.lowerArm(side)]: a.l,
+      // الرسغ صار جزءاً من الحلّ. بدونه كانت لفّة الساعد وحدها تقرّر اتّجاه
+      // الكفّ، فيخرج مقلوباً في أغلب المواضع.
+      [BONES.hand(side)]: a.h,
+    };
+  };
+}
+
+export const ARM_POSITIONS = {
+  // صفرٌ في كل شيء = وضعية السكون تماماً: ذراعٌ مسترخية إلى جانب الجسم.
+  // والرسغ مذكورٌ هنا أيضاً: بدونه يبقى الكفّ على دوران المفتاح السابق
+  // فتعود الذراع إلى جنبها والكفّ ملتوٍ.
+  rest: (s) => ({
+    [BONES.shoulder(s)]: [0, 0, 0],
+    [BONES.upperArm(s)]: [0, 0, 0],
+    [BONES.lowerArm(s)]: [0, 0, 0],
+    [BONES.hand(s)]:     [0, 0, 0],
+  }),
+  chest:    solvedArm('chest'),
+  face:     solvedArm('face'),
+  forehead: solvedArm('forehead'),
+  outward:  solvedArm('outward'),
+  side:     solvedArm('side'),
+};
+
+/**
+ * Compose one full keyframe pose.
+ *
+ * @param {Object} spec
+ *   arm   : { R: 'chest', L: 'rest' }      — position name per side
+ *   hand  : { R: 'flat',  L: 'fist' }      — hand shape per side
+ *   head  : [x, y, z]                      — optional head tilt
+ *   extra : { 'BoneName': [x,y,z] }        — manual overrides, applied last
+ */
+export function composePose({ arm = {}, hand = {}, head, extra = {} } = {}) {
+  let pose = {};
+
+  for (const side of SIDES) {
+    const position = arm[side];
+    if (position && ARM_POSITIONS[position]) {
+      pose = { ...pose, ...ARM_POSITIONS[position](side) };
+    }
+    const shape = hand[side];
+    if (shape) pose = { ...pose, ...handShape(shape, side) };
+  }
+
+  if (head) pose[BONES.head] = head;
+
+  return { ...pose, ...extra };
+}

@@ -1,0 +1,279 @@
+import React, { Suspense, useEffect, useRef } from 'react';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
+import { useGLTF, useAnimations, OrbitControls } from '@react-three/drei';
+import { useSignPlayer } from '../signing/useSignPlayer';
+
+/* ═══ الروبوت ═══════════════════════════════════════════════════════════ */
+
+function RobotAvatar({ signerRef }) {
+  const group = useRef();
+  const { scene, animations } = useGLTF('/last1.glb');
+  const { actions } = useAnimations(animations, group);
+
+  const player = useSignPlayer({ scene, actions });
+
+  // ── ملامح الوجه (Morph Targets) ────────────────────────────────────────
+  // النموذج يحمل هدفَي تشكيل: Happy و Sad. نكشفهما على window لتجربتهما
+  // بسرعة من طرفية المتصفّح:  tarjumanFace.happy(1)  /  .sad(1)  /  .neutral()
+  // ولاحقاً يقودهما مستخرِج ملامح الوجه بدل الاستدعاء اليدوي.
+  useEffect(() => {
+    const targets = [];
+    scene.traverse((o) => {
+      if (o.isMesh && o.morphTargetDictionary && o.morphTargetInfluences) targets.push(o);
+    });
+    if (targets.length === 0) { console.log('[face] لا توجد أهداف تشكيل في النموذج'); return; }
+
+    const names = Object.keys(targets[0].morphTargetDictionary);
+    const set = (name, value) => {
+      const v = Math.max(0, Math.min(1, Number(value) || 0));
+      targets.forEach((m) => {
+        const i = m.morphTargetDictionary[name];
+        if (i !== undefined) m.morphTargetInfluences[i] = v;
+      });
+    };
+    /* ── الرمش التلقائي ────────────────────────────────────────────────
+       المقطع Robot_Idle يحرّك العظام فقط؛ أمّا الجفون فنقودها من هنا
+       حتى يبقى توقيت الرمش عشوائيًا طبيعيًا ولا يتصادم مع Happy/Sad. */
+    const CLOSE = 90, HOLD = 45, OPEN = 170;      // ملّي ثانية
+    let raf = 0, phase = null, held = null, auto = true;
+    let nextAt = performance.now() + 1200 + Math.random() * 2500;
+
+    const eyes = (l, r) => { set('BlinkL', l); set('BlinkR', r); };
+    const curve = (t, hold) => {
+      if (t < CLOSE) return t / CLOSE;
+      if (t < CLOSE + hold) return 1;
+      return Math.max(0, 1 - (t - CLOSE - hold) / OPEN);
+    };
+    const fire = (l, r, hold = HOLD) => { phase = { t0: performance.now(), l, r, hold }; };
+
+    const tick = () => {
+      raf = requestAnimationFrame(tick);
+      const now = performance.now();
+      if (held) { eyes(held.l, held.r); return; }
+      if (!phase && auto && now >= nextAt) fire(1, 1);
+      if (!phase) return;
+      const t = now - phase.t0;
+      if (t >= CLOSE + phase.hold + OPEN) {
+        phase = null; eyes(0, 0);
+        nextAt = now + 1800 + Math.random() * 4200;
+      } else {
+        const w = curve(t, phase.hold);
+        eyes(w * phase.l, w * phase.r);
+      }
+    };
+    raf = requestAnimationFrame(tick);
+
+    const api = {
+      names,
+      set,
+      happy:   (v = 1) => { set('Sad', 0);   set('Happy', v); },
+      sad:     (v = 1) => { set('Happy', 0); set('Sad', v); },
+      neutral: ()      => { set('Happy', 0); set('Sad', 0); },
+
+      // رمشة واحدة بالعينين
+      blink: () => { held = null; fire(1, 1); },
+      // غمزة: تغمض عينًا واحدة وتبقى الأخرى مفتوحة — wink('L') أو wink('R')
+      wink: (eye = 'L') => {
+        held = null;
+        const l = String(eye).toUpperCase() === 'L' ? 1 : 0;
+        fire(l, 1 - l, 260);
+      },
+      // إغماض مستمر: close() أو close('L') أو close('R')
+      close: (eye = 'both') => {
+        const e = String(eye).toUpperCase();
+        phase = null;
+        held = { l: (e === 'R' ? 0 : 1), r: (e === 'L' ? 0 : 1) };
+      },
+      // فتح العينين وإعادة الرمش التلقائي
+      open: () => { held = null; phase = null; eyes(0, 0); nextAt = performance.now() + 1200; },
+      // تشغيل/إيقاف الرمش التلقائي
+      autoBlink: (on = true) => { auto = !!on; if (!on) { phase = null; eyes(0, 0); } },
+    };
+    window.tarjumanFace = api;
+    console.log(`[face] الملامح جاهزة: ${names.join(', ')} — tarjumanFace.happy(1) / .sad(1) / .blink() / .wink('L') / .close() / .open()`);
+    return () => {
+      cancelAnimationFrame(raf);
+      if (window.tarjumanFace === api) delete window.tarjumanFace;
+    };
+  }, [scene]);
+
+  // ارفع المشغِّل لأعلى حتى تستطيع الواجهة إطلاق الإشارات.
+  useEffect(() => { if (signerRef) signerRef.current = player; }, [signerRef, player]);
+
+  // مقطعٌ واحد فقط يعمل: السكون.
+  //
+  // الملفّ يحوي Robot_Idle و Robot_Talk. والثاني لا يُشغَّل إطلاقاً — ليس
+  // للروبوت ما يقوله، وتشغيله يجعله يثرثر بلا مناسبة. يُوقَف صراحةً ويُصفَّر
+  // وزنه، فلا يكتب في الهيكل ولو أيقظه شيءٌ لاحقاً.
+  useEffect(() => {
+    if (!actions || Object.keys(actions).length === 0) return;
+    const keys = Object.keys(actions);
+
+    const idleKey =
+      keys.find((k) => k.toLowerCase().includes('idle')) ||
+      keys.find((k) => k.toLowerCase().includes('stand')) ||
+      keys.find((k) => k.toLowerCase().includes('rest')) ||
+      keys[0];
+
+    keys.forEach((k) => {
+      const a = actions[k];
+      if (!a) return;
+      a.stop();
+      if (k !== idleKey) { a.enabled = false; a.setEffectiveWeight(0); }
+    });
+
+    if (idleKey && actions[idleKey]) {
+      actions[idleKey].enabled = true;
+      actions[idleKey].setEffectiveWeight(1);
+      actions[idleKey].reset().fadeIn(0.3).play();
+    }
+    console.log(`[robot] idle clip: ${idleKey}  `
+      + `(idle only; ${keys.filter((k) => k !== idleKey).join(', ') || 'none'} disabled)`);
+
+    return () => { if (idleKey && actions[idleKey]) actions[idleKey].fadeOut(0.3); };
+  }, [actions]);
+
+  // يجب أن يعمل مشغِّل الإشارات بعد مازج الحركات في كل إطار، وإلّا كتب مقطع
+  // السكون فوق الوضعية التي طبّقناها للتوّ.
+  useFrame((_, delta) => player.update(delta));
+
+  return (
+    <group ref={group} position={[0, -0.3, 0]} scale={0.7}>
+      <primitive object={scene} />
+    </group>
+  );
+}
+
+// يوجِّه الكاميرا معامدة لمستوى العينين والوجه لتكون النظرة مستقيمة ومباشرة للكاميرا
+function CameraSetup() {
+  const { camera } = useThree();
+  useEffect(() => {
+    camera.position.set(0, 0.60, 2.05);
+    camera.lookAt(0, 0.60, 0);
+    camera.fov = 44;
+    camera.updateProjectionMatrix();
+  }, [camera]);
+  return null;
+}
+
+const RobotCanvas = React.memo(function RobotCanvas({ signerRef }) {
+  return (
+    <Canvas
+      className="!absolute inset-0 w-full h-full"
+      camera={{ position: [0, 0.60, 2.05], fov: 44 }}
+    >
+      <CameraSetup />
+      {/* إضاءة متوازنة تبرز تفاصيل الثوب وحركات اليدين وملامح الوجه */}
+      <ambientLight intensity={0.9} />
+      <directionalLight position={[0, 4, 4]} intensity={1.0} />
+      <directionalLight position={[-4, 2, 2]} intensity={0.5} />
+      <directionalLight position={[4, 2, 2]} intensity={0.5} />
+      <Suspense fallback={null}>
+        <RobotAvatar signerRef={signerRef} />
+      </Suspense>
+      <OrbitControls target={[0, 0.60, 0]} makeDefault enablePan={true} enableZoom={true} minDistance={0.5} maxDistance={10} />
+    </Canvas>
+  );
+});
+
+/* ═══ المسرح ════════════════════════════════════════════════════════════ */
+
+/**
+ * RobotStage — الروبوت، ومعاينة المستخدم لنفسه، وحالة الالتقاط.
+ *
+ * ارتفاعه يملأ ما يتبقّى من العمود على الشاشات العريضة، ويُقاس بـdvh على
+ * الضيّقة (لا vh — فشريط عنوان المتصفّح المتقلّص يترك فجوة قافزة).
+ */
+/**
+ * RobotStage — الروبوت، ومعاينة المستخدم لنفسه، وحالة الالتقاط.
+ *
+ * المعاينة ليست زينة: المستخدم الأصمّ يشير بيديه، وبدون أن يرى نفسه لا يعرف
+ * أهو داخل الإطار أصلاً أم لا. وإطارها يحمر أثناء الالتقاط، فيرى بعينه أنّ
+ * إشارته تُسجَّل الآن.
+ */
+export default function RobotStage({ signerRef, cameraOn, capturing, previewUrl, handsVisible }) {
+  return (
+    <div
+      className="cq relative rounded-card border border-hair bg-surface overflow-clip
+                 shadow-card isolate flex-1 min-h-0 w-full h-full min-h-[22rem]"
+    >
+      {/* بقعتا لونٍ باهتتان وضجيجٌ خفيف فوقهما — عمقٌ بلا حدٍّ مرئي ولا اتجاه
+          يسحب العين، ويمنع الضجيجُ التشريطَ على الشاشات ذات الثماني بتّات. */}
+      <div aria-hidden="true" className="stage-field absolute inset-0" />
+
+      {/* ظلّ أرضي يربط الروبوت بالسطح بدل أن يطفو في فراغ */}
+      <div
+        aria-hidden="true"
+        className="absolute bottom-[5%] left-1/2 -translate-x-1/2 w-[35%] h-6
+                   rounded-[50%] bg-ink/8 blur-xl pointer-events-none"
+      />
+
+      <RobotCanvas signerRef={signerRef} />
+
+      {/* شارة الالتقاط — أعلى المسرح، حيث ينظر المستخدم وهو يشير */}
+      {cameraOn && (
+        <div
+          className={`absolute top-4 right-4 flex items-center gap-2 h-8 px-3 rounded-chip
+                      border text-sm font-medium transition-colors
+            ${capturing ? 'bg-live-wash/90 border-live/30 text-live'
+              : 'bg-surface/85 border-hair text-ink-3'}`}
+          aria-live="polite"
+        >
+          <span className={`size-2 rounded-full ${capturing ? 'bg-live animate-pulse' : 'bg-ink-3/50'}`} />
+          {capturing ? 'جارٍ تسجيل الإشارة' : 'بانتظار إشارتك'}
+        </div>
+      )}
+
+      {/* معاينة ذاتية — المستخدم الأصمّ يشير بيديه، وبدون أن يرى نفسه لا
+          يعرف أهو داخل الإطار أصلاً. عرضها نسبةٌ من المسرح لا رقمٌ ثابت،
+          و4:3 محجوزة سلفاً فلا يقفز التخطيط عند وصول أوّل إطار. */}
+      {cameraOn && (
+        <figure
+          className={`absolute bottom-4 left-4 w-[clamp(8.5rem,24cqi,12rem)] rounded-ctl
+                      overflow-clip bg-ink shadow-pop outline outline-2 transition-colors
+            ${capturing ? 'outline-live' : 'outline-white/70'}`}
+        >
+          {previewUrl ? (
+            <img
+              src={previewUrl}
+              alt="معاينة الكاميرا"
+              width="320"
+              height="240"
+              className="block w-full aspect-[4/3] object-cover"
+            />
+          ) : (
+            <div className="w-full aspect-[4/3] flex items-center justify-center text-sm text-white/50">
+              جارٍ تشغيل الكاميرا…
+            </div>
+          )}
+
+          <figcaption
+            className="absolute top-1.5 right-1.5 flex items-center gap-1.5
+                       bg-ink/70 px-2 h-5 rounded-full backdrop-blur-sm"
+          >
+            <span className={`size-1.5 rounded-full ${handsVisible ? 'bg-good' : 'bg-white/40'}`} />
+            <span className="text-2xs text-white/90">
+              {handsVisible ? 'تم رصد اليد' : 'لا توجد يد'}
+            </span>
+          </figcaption>
+        </figure>
+      )}
+
+      {/* الحالة الفارغة — قبل تشغيل الكاميرا */}
+      {!cameraOn && (
+        /* أعلى اليمين، في نفس موضع شارة الالتقاط — فالعين تتعلّم أن حالة
+           المسرح تُقرأ من هناك دائماً. وكان موضعها السابق أسفل الوسط، فوق
+           قدمَي الروبوت تماماً. */
+        <p
+          className="absolute top-4 right-4 max-w-[min(calc(100%-2rem),22rem)]
+                     text-sm text-ink-3 text-pretty bg-surface/85 backdrop-blur-sm
+                     px-3 py-1.5 min-h-8 flex items-center rounded-chip border border-hair"
+        >
+          شغِّل الكاميرا لتبدأ الترجمة، أو اكتب كلمة ليؤدّيها الروبوت
+        </p>
+      )}
+    </div>
+  );
+}
+
+useGLTF.preload('/last1.glb');

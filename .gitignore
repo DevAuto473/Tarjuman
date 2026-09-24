@@ -61,3 +61,6 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+
+# نموذج الوجه يُنزَّل عند أوّل تشغيل لـ bench:face — لا يُتعقَّب (نحو 3 ميغابايت)
+models/

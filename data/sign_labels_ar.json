@@ -1,0 +1,25 @@
+{
+  "_note": "Arabic display names for words that are not in vocabulary.py. The 3D avatar and the app show these. vocabulary.py wins where a word exists in both - it carries the sign's attributes too, not just a name. Keys starting with _ are comments.",
+
+  "3aElh": "عائلة",
+  "Abshr": "أبشر",
+  "ahln_wshln": "أهلاً وسهلاً",
+  "al7mdllh": "الحمد لله",
+  "salam_kaml": "السلام عليكم ورحمة الله وبركاته",
+  "mtrjm_lght_esharh": "مترجم لغة إشارة",
+  "itjah": "اتجاه",
+  "dke": "ذكي",
+
+  "_letters": "حروف الهجاء",
+  "alef": "ألف",
+  "taa": "تاء",
+  "jem": "جيم",
+  "raa": "راء",
+  "mem": "ميم",
+  "non": "نون",
+  "fe": "فاء",
+
+  "_grammar": "علامات صرفية",
+  "tAneeth": "تأنيث",
+  "thnaEe": "ثنائي"
+}

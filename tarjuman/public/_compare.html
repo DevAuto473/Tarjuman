@@ -1,0 +1,88 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>GLB compare</title>
+<style>
+  html,body{margin:0;background:#101014;color:#eee;font:13px system-ui}
+  #row{display:flex}
+  .pane{position:relative}
+  .lbl{position:absolute;top:6px;left:8px;background:#000a;padding:3px 8px;border-radius:5px;z-index:2}
+</style>
+<div id="row"></div>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.module.js",
+"three/addons/":"https://cdn.jsdelivr.net/npm/three@0.185.0/examples/jsm/"}}
+
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+const W=520,H=720;
+const files=[['original','/last11.glb'],['compressed','/last11.pi.glb']];
+window.__ready=0; window.__err=[];
+const params=new URLSearchParams(location.search);
+const view=params.get('view')||'body';   // body | face
+for (const [label,url] of files){
+  const pane=document.createElement('div'); pane.className='pane';
+  const tag=document.createElement('div'); tag.className='lbl'; tag.textContent=label+' — '+url;
+  pane.appendChild(tag); document.getElementById('row').appendChild(pane);
+  const renderer=new THREE.WebGLRenderer({antialias:true, preserveDrawingBuffer:true});
+  renderer.setSize(W,H); renderer.setPixelRatio(1);
+  renderer.outputColorSpace=THREE.SRGBColorSpace;
+  pane.appendChild(renderer.domElement);
+  const scene=new THREE.Scene(); scene.background=new THREE.Color(0x15151a);
+  const cam=new THREE.PerspectiveCamera(30,W/H,0.01,100);
+  scene.add(new THREE.HemisphereLight(0xffffff,0x222233,2.2));
+  const key=new THREE.DirectionalLight(0xffffff,2.0); key.position.set(1.5,2.5,2.5); scene.add(key);
+  const fill=new THREE.DirectionalLight(0xffffff,0.8); fill.position.set(-2,1,1.5); scene.add(fill);
+  const t0=performance.now();
+  new GLTFLoader().load(url,(g)=>{
+    scene.add(g.scene);
+    g.scene.traverse(o=>{ if(o.name==='Face') o.visible=false; });
+    const box=new THREE.Box3().setFromObject(g.scene);
+    const c=box.getCenter(new THREE.Vector3()), s=box.getSize(new THREE.Vector3());
+    if(view==='face'){
+      const head=box.max.y - s.y*0.13;
+      cam.position.set(c.x+s.y*0.10, head, c.z+s.y*0.30);
+      cam.lookAt(c.x, head, c.z);
+    } else if(view==='hands'){
+      const h = g.scene.getObjectByName('HandR') ||
+                g.scene.getObjectByName('HandL') ||
+                null;
+      const t = new THREE.Vector3();
+      if(h){ h.updateWorldMatrix(true,false); h.getWorldPosition(t); }
+      else { t.set(c.x + s.x*0.42, c.y - s.y*0.18, c.z); }
+      // الذراعان متدلّيتان في وضع الراحة، فالكاميرا تأتي من الأمام لا من الجانب،
+      // وإلّا وقعت داخل السروال.
+      cam.position.set(t.x, t.y - s.y*0.07, t.z + s.y*0.34);
+      cam.lookAt(t.x, t.y - s.y*0.07, t.z);
+    } else {
+      cam.position.set(c.x+s.y*0.35, c.y+s.y*0.05, c.z+s.y*1.5);
+      cam.lookAt(c.x,c.y,c.z);
+    }
+    renderer.render(scene,cam);
+    window.__ready++; (window.__panes=window.__panes||[]).push({renderer,scene,cam,label});
+    tag.textContent=`${label} — ${(performance.now()-t0|0)}ms`;
+  },undefined,(e)=>{ window.__err.push(label+': '+e); tag.textContent=label+' FAILED'; });
+}
+// فرقٌ بكسليٌّ بين اللوحتين — إثباتٌ برمجيٌّ لا بالعين.
+window.__measure = () => {
+  const cs=[...document.querySelectorAll('canvas')];
+  if(cs.length<2) return {error:'panes not ready'};
+  (window.__panes||[]).forEach(p=>p.renderer.render(p.scene,p.cam));
+  const grab=(c)=>{const o=document.createElement('canvas');o.width=c.width;o.height=c.height;
+    o.getContext('2d').drawImage(c,0,0);
+    return o.getContext('2d').getImageData(0,0,c.width,c.height).data;};
+  const a=grab(cs[0]), b=grab(cs[1]);
+  let n=0,sum=0,max=0,lit=0;
+  for(let i=0;i<a.length;i+=4){
+    const d=(Math.abs(a[i]-b[i])+Math.abs(a[i+1]-b[i+1])+Math.abs(a[i+2]-b[i+2]))/3;
+    if(a[i]>25||a[i+1]>25||a[i+2]>25) lit++;
+    if(d>0.5) n++;
+    sum+=d; max=Math.max(max,d);
+  }
+  const px=a.length/4;
+  return {view, litPixels:lit, pctDiffering:+(n/px*100).toFixed(2),
+    meanAbsDiff:+(sum/px).toFixed(3), maxChannelDiff:+max.toFixed(1),
+    meanOverLit:+(sum/Math.max(lit,1)).toFixed(3)};
+};
+</script>

@@ -1,0 +1,51 @@
+# requirements-pi.txt — Raspberry Pi (aarch64), COLLECTING ONLY
+# =============================================================================
+# The main requirements.txt is a `pip freeze` taken on Windows. It carries the
+# whole project: training (scikit-learn, onnx), the server (onnxruntime,
+# websockets), speech (edge-tts, groq, openai) and plotting (seaborn). None of
+# that is needed to record a dataset, and installing it on a Pi means a long
+# build for packages the collector never imports.
+#
+# This file is the collector's actual dependency closure, nothing more.
+#
+# Every pin below was checked to publish a cp311 manylinux aarch64 wheel — the
+# interpreter Raspberry Pi OS (Bookworm) ships — so `pip install` downloads and
+# does not compile. Versions match the laptop exactly, so features computed on
+# the Pi and features computed for training are produced by the same code.
+#
+#   TWO PINS THAT LOOK WRONG AND ARE NOT (both measured, see PI_SETUP.md):
+#     numpy 2.x  -> `numpy<2` is the usual advice against the 2024 ABI break,
+#                   but mediapipe needs jax/jaxlib and jaxlib==0.10.1 requires
+#                   numpy>=2.0 — resolving this file with numpy==1.26.4 fails
+#                   with ResolutionImpossible. And the break does not happen:
+#                   Hands().process() was run against a numpy-2.4.6 array and
+#                   returned normally. MediaPipe crosses pybind11 as a buffer,
+#                   not through the numpy C API that changed.
+#     contrib    -> not a choice. mediapipe==0.10.14 declares
+#                   opencv-contrib-python as a hard dependency; in a venv where
+#                   only mediapipe was asked for, pip installed it unprompted.
+#                   Requesting opencv-python instead yields both, not one.
+#
+#   NOT LISTED, ON PURPOSE:
+#     picamera2   -> an apt package, not a pip one. See PI_SETUP.md: the venv
+#                    must be created with --system-site-packages or it will be
+#                    invisible no matter how correctly it is installed.
+#     pygrabber   -> Windows DirectShow. Harmless (pure-python wheel) but the
+#                    only code that imports it returns early off win32.
+#
+# Install:  pip install -r requirements-pi.txt
+
+mediapipe==0.10.14
+numpy==2.4.6
+opencv-contrib-python==5.0.0.93
+protobuf==4.25.9
+python-dotenv==1.0.1
+
+# Pulled in by mediapipe; pinned so the Pi and the laptop agree.
+absl-py==2.4.0
+attrs==26.1.0
+flatbuffers==25.12.19
+jax==0.10.1
+jaxlib==0.10.1
+matplotlib==3.11.1
+sounddevice==0.5.5

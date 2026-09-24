@@ -94,30 +94,56 @@ SHOULDER_HALF_W = 0.50
 # had carefully placed arrived 16% closer to the body than intended. A hand
 # cleared to just in front of the chest ended up inside it.
 HUMAN_ARM_SPAN = 1.60      # people cluster tightly around this
-RIG_ARM_SPAN = 1.35        # measured from TarjumanRobot2.glb (1.130 / 0.840)
+RIG_ARM_SPAN = 1.44        # measured from last.glb: 0.2796 m arm / 0.1942 m shoulders
 ARM_SPAN = RIG_ARM_SPAN    # what the IK actually solves in
 
 # Upper-arm / forearm split, read from the rig itself (0.580 and 0.550 units).
 # Taking it from the rig rather than assuming 50/50 is what keeps the ELBOW in
 # the same relative place as yours, not just the hand.
-UPPER_FRAC = 0.513
-LOWER_FRAC = 0.487
+UPPER_FRAC = 0.522
+LOWER_FRAC = 0.478
 
 # -- The robot's own body, measured from the GLB ------------------------------
 # Measured, not guessed. Guessing here is what put the hand behind the head:
 # the head reaches 0.59 forward and the keep-out volume allowed 0.30, so a hand
 # raised to the temple was placed a third of a head INSIDE the skull.
-TORSO_HALF_W = 0.46
-TORSO_HALF_D = 0.46
-TORSO_TOP = -0.38          # the chest rises above the shoulder line
-TORSO_BOTTOM = 0.83
+# أُعيد القياس من الشبكات نفسها في TarjumanRobot2.glb، بوحدات هذا الملفّ
+# (نصف عرض الكتفين = 0.50، ومبدأ المحاور خطُّ الكتفين، و+y إلى الأسفل):
+#
+#     الجذع  x∈[-0.50,0.50]  y∈[-0.38,1.42]  z∈[-0.46,0.46]
+#     الرأس  x∈[-0.75,0.74]  y∈[-1.55,-0.08] z∈[-0.59,0.59]
+#
+# وكان مجسّم الرأس يمتدّ إلى y = -0.53 فقط، أي أنّ نصفه الأسفل — الوجه
+# والشاشة من مستوى الذقن إلى الكتف — كان خارج منطقة المنع تماماً. فكفٌّ
+# يرتفع إلى الجبهة يمرّ عبره ولا يُرصَد. ومثله الجذع: قاعدته كانت 0.83
+# بينما الخصر عند 1.42، فثُلثه الأسفل كان مباحاً.
+TORSO_HALF_W = 0.58
+TORSO_HALF_D = 0.43
+TORSO_TOP = -0.41          # the chest rises above the shoulder line
+TORSO_BOTTOM = 1.54
 
-HEAD_CENTRE_Y = -1.04      # above the shoulders (remember: +y is down)
-HEAD_HALF_W = 0.75         # includes the ears
-HEAD_HALF_H = 0.51
-HEAD_HALF_D = 0.59         # the face/screen juts well forward
+HEAD_CENTRE_Y = -0.67      # above the shoulders (remember: +y is down)
+HEAD_HALF_W = 0.30
+HEAD_HALF_H = 0.38
+HEAD_HALF_D = 0.44         # the face juts forward
 
-BODY_CLEARANCE = 0.12      # gap so limbs never graze the surface
+# -- الكفّ له حجمٌ أيضاً ------------------------------------------------------
+# الهدف الذي يحلّه الـIK هو مركز الكفّ، لكنّ الأصابع تمتدّ بعده. قِيست على
+# الهيكل: من مفصل المعصم إلى أبعد طرفِ إصبع 0.735 وحدة هيكل = 0.88 بوحدات
+# هذا الملفّ. وكانت الخلوصُ 0.12 فقط، فكان يُبعِد المعصمَ ويترك 88% من الكفّ
+# داخل الجسم. ومن هنا كانت الأصابع تغرز في شاشة الوجه بينما يبدو المعصم سليماً.
+HAND_REACH = 0.61
+
+# ولماذا 0.40 تحديداً: هي أقلُّ قليلاً من 0.43 — المسافة من مركز الكفّ إلى طرف
+# الإصبع. فحين يُدفَع مركزُ الكفّ 0.40 أمام سطح الرأس، تبلغ الأطرافُ السطح
+# نفسه فتلمسه. وهذا هو المطلوب: «شكراً» تلمس الذقن، ولو كانت الخلوص أكبر من
+# طول الأصابع لاستحال على الهيكل أداؤها مهما صحّ باقي الحساب. وكانت 0.55.
+#
+# والهيكل الحالي بشريُّ النسب، فلا يحتاج التعويض الذي احتاجه سابقه:
+#
+#     عرض الرأس ÷ عرض الكتفين   = 0.50   (الإنسان ≈ 0.59،  الروبوت القديم 1.50)
+#     طول الذراع ÷ ارتفاع الرأس = 1.93   (الإنسان ≈ 2.30،  الروبوت القديم 0.92)
+BODY_CLEARANCE = 0.40      # gap so the FINGERS, not just the wrist, stay clear
 
 # Minimum forward offset for a hand, even out at the sides. Signing happens in
 # the space in FRONT of the signer; a hand level with the middle of the body
@@ -309,7 +335,8 @@ def _segment_hits_torso(a, b, samples: int = 9, skip_start: float = 0.0) -> bool
 
 
 def arm_directions(target, side: str,
-                   upper_len: float = None, lower_len: float = None) -> dict:
+                   upper_len: float = None, lower_len: float = None,
+                   tip_offset=None, thumb_offset=None) -> dict:
     """
     Upper-arm and forearm directions that reach `target` (body coordinates).
 
@@ -324,6 +351,12 @@ def arm_directions(target, side: str,
     it is the axis a single camera never measured, so correcting it invents
     nothing, whereas moving the hand sideways or vertically would corrupt the
     location parameter that distinguishes one sign from another.
+
+    `tip_offset` هي إزاحةُ طرف الإصبع عن المعصم في فضاء الجسم. بدونها كان
+    الفحص يسأل عن المعصم وحده، فيمرّ وضعٌ معصمُه أمام الوجه وأصابعُه داخل
+    الشاشة — وهو بالضبط ما كان يحدث. قِيس أنّ كلّ الاختراقات المتبقّية كانت
+    من أطراف الأصابع لا من المعصم: السبّابة 12 والإبهام 11 والوسطى 7
+    والخنصر 5، والمعصم صفر.
     """
     upper_len = ARM_SPAN * UPPER_FRAC if upper_len is None else upper_len
     lower_len = ARM_SPAN * LOWER_FRAC if lower_len is None else lower_len
@@ -345,22 +378,35 @@ def arm_directions(target, side: str,
         return {f"UpperArm.{side}": unit(down), f"LowerArm.{side}": unit(down)}
 
     # (extra forward push, outward pole weight, backward/forward pole lean)
+    # الدرجتان الأخيرتان أُضيفتا للأصابع: الكفّ يخلص عند 0.90 بينما طرف
+    # السبّابة يحتاج دفعاً أبعد حين تشير الأصابع نحو الرأس.
     attempts = ((0.00, 0.75, 0.30), (0.10, 1.40, -0.20), (0.22, 2.20, -0.55),
                 (0.36, 3.20, -0.90), (0.52, 4.50, -1.30), (0.70, 2.00, -2.20),
-                (0.90, 0.60, -3.00))
+                (0.90, 0.60, -3.00), (1.15, 0.40, -3.60), (1.45, 0.30, -4.20))
 
     # Keep the BEST attempt, not the first. A cross-body reach — left hand to
     # the right hip — genuinely cannot avoid passing in front of the torso, so
     # some poses have no perfectly clean answer; returning the least-bad one
     # beats returning the first one tried, which was usually the worst.
     best = None
+    reach = (upper_len + lower_len) * 0.985
     for push, out_w, lean in attempts:
         t = base_target.copy()
         t[2] -= push                       # -z is toward the camera
+        t = _pull_into_reach(shoulder, t, reach)
         elbow, t = _solve_arm(shoulder, t, sign, upper_len, lower_len, out_w, lean)
         score = (_torso_overlap(shoulder, elbow, skip_start=0.35)
                  + _torso_overlap(elbow, t)
                  + (4 if _inside_body(t) else 0))
+        if tip_offset is not None:
+            # طرف الإصبع، ثمّ منتصف الكفّ — فلا يُقبَل وضعٌ معصمُه خارج
+            # الجسم وأصابعُه داخله.
+            score += (6 if _inside_body(t + tip_offset) else 0)
+            score += (3 if _inside_body(t + tip_offset * 0.5) else 0)
+        if thumb_offset is not None:
+            # الإبهام يخرج جانباً عن محور الكفّ، فلا يكفيه فحصُ المحور: كان
+            # وحده مسؤولاً عن أكثر من نصف ما تبقّى من الاختراقات.
+            score += (5 if _inside_body(t + thumb_offset) else 0)
         if best is None or score < best[0]:
             best = (score, elbow, t)
         if score == 0:
@@ -371,6 +417,33 @@ def arm_directions(target, side: str,
         f"UpperArm.{side}": unit(elbow - shoulder),
         f"LowerArm.{side}": unit(t - elbow),
     }
+
+
+def _pull_into_reach(shoulder, target, reach):
+    """
+    هدفٌ أبعد من الذراع: يُسحَب إلى سطح كرة الوصول مع الحفاظ على عمقه.
+
+    القصُّ على امتداد الخطّ شوّه المعنى: سحبُ الهدف نحو الكتف يعيده إلى داخل
+    الرأس تماماً — وهو ما كنّا نهرب منه. العمق هو ما يُبقي الكفّ مرئياً، فيُحفَظ،
+    ويُتنازَل عن الارتفاع والعرض. وهذا لا يقع إلّا حين يستحيل الوصول هندسياً،
+    أي حين يطلب الوضعُ من ذراعٍ قصيرة أن تلتفّ حول رأسٍ كبير.
+    """
+    v = np.asarray(target, dtype=np.float64) - shoulder
+    dist = float(np.linalg.norm(v))
+    if dist <= reach:
+        return np.asarray(target, dtype=np.float64)
+
+    depth = v[2]
+    remaining = reach ** 2 - depth ** 2
+    if remaining > 1e-6:
+        flat = v[:2]
+        n = float(np.linalg.norm(flat))
+        if n > 1e-6:
+            flat = flat * (float(np.sqrt(remaining)) / n)
+            return shoulder + np.array([flat[0], flat[1], depth])
+
+    # حتى العمق وحده خارج المدى: لا مفرّ من القصّ على الخطّ.
+    return shoulder + v * (reach / dist)
 
 
 def _solve_arm(shoulder, target, sign, upper_len, lower_len, out_w, lean):
@@ -455,14 +528,255 @@ def finger_directions(pts: np.ndarray, side: str) -> dict:
     return out
 
 
-def frame_to_bone_dirs(frame) -> dict:
+# -- على أيّ جانبٍ من المحور x يقف كلّ كتف --------------------------------
+# كلّ ما سبق يُحلّ في فضاء الجسم: الكتف اليمنى عند +x واليسرى عند -x، وهو
+# اصطلاح `arm_directions` نفسه (`sign = +1 for R`). وليس هذا اصطلاحاً كونياً،
+# بل هو ما كان عليه الهيكل الذي ضُبطت عليه هذه الرياضيات:
+#
+#     TarjumanRobot2.glb   Shoulder.R عند x = +0.363 طولِ ذراع
+#                          Shoulder.L عند x = -0.363
+#
+# وهيكلُ Mixamo البشري معكوسٌ عنه تماماً — وهو الصحيح تشريحياً، فالواقفُ
+# مواجهاً الكاميرا (+z نحوها، +y إلى أعلى) تقع يسارُه عند +x:
+#
+#     last.glb             Shoulder.R عند x = -0.347
+#                          Shoulder.L عند x = +0.347
+#
+# فالاتجاهات تخرج صحيحةً في ذاتها — قِيس أنّ متّجه المرفق منسوباً إلى الكتف
+# يطابق المرجع إلى ثلاث منازل — لكنّها تُطبَّق على كتفٍ في الجهة المقابلة،
+# فيتّجه المرفقُ إلى داخل الجسم بدل خارجه: ذراعٌ مطويّة على الصدر بدل ذراعٍ
+# مفرودة إلى الجنب. وهذا هو «انعكاس المرفق» بعينه.
+#
+# والعلاج تبديلُ الوسمين لا مرآةُ الأرقام. فالكتف اليسرى في الهيكل الجديد
+# تقف حيث كانت اليمنى في المرجع تماماً، فإعطاؤها اتجاهاتِ اليمنى يُعيد
+# المشهد كما كان بالضبط — الموضع نفسه على الشاشة، والمرفق نفسه، وعموديّ
+# الكفّ نفسه (قِيس: فرقٌ دون 2%). أمّا مرآةُ x فتعمل هندسياً لكنّها تنقل
+# الذراع إلى الشقّ المقابل من الشاشة، وتقتضي معها قلبَ عموديّ الكفّ — لأنّ
+# العموديّ متّجهٌ زائف، حاصلُ ضربٍ اتّجاهي، فلا ينقلب كما تنقلب الاتجاهات.
+#
+# اجعلها False إن عاد الهيكل إلى اصطلاح المرجع (يمينٌ عند +x).
+RIG_SIDES_SWAPPED = True
+
+
+def _relabel_sides(pose: dict) -> dict:
+    """يبدّل لاحقتَي .L و .R في أسماء العظام دون أن يمسّ الأرقام."""
+    if not RIG_SIDES_SWAPPED:
+        return pose
+    out = {}
+    for name, value in pose.items():
+        if name.endswith(".R"):
+            out[name[:-2] + ".L"] = value
+        elif name.endswith(".L"):
+            out[name[:-2] + ".R"] = value
+        else:
+            out[name] = value
+    return out
+
+
+# =============================================================================
+#  Anchor retargeting - putting the hand where the SIGN is, not where the
+#  signer's coordinates were
+# =============================================================================
+# Everything above solves the arm to a point expressed in shoulder-width units.
+# That normalisation removes the signer's height and their distance from the
+# camera, which is what makes the recogniser work. What it does NOT remove is
+# the signer's PROPORTIONS.
+#
+# A chin sits a certain distance above the shoulders, and that distance, divided
+# by shoulder width, is not the same number for a person and for this rig:
+#
+#       your chin        ~ -0.20 .. -0.26      (varies person to person)
+#       the rig's chin      -0.297              (measured from last.glb)
+#
+# So "put the hand where the recording says" lands the hand below the rig's
+# chin, every time, by the difference between the two bodies. No amount of
+# tuning the arm length or the keep-out volume touches this: those decide where
+# the hand may NOT go, not where it is asked to go. And signs that touch the
+# face - شكراً at the chin, أب at the forehead - are then wrong in the one place
+# their meaning lives.
+#
+# The fix is to stop copying coordinates and start copying RELATIONSHIPS. The
+# pipeline already records, per frame, how far the wrist is from each of five
+# body landmarks: that is what separates أب from أم. So when the hand is near a
+# landmark, place it near the RIG's matching landmark, offset by however far it
+# sat from the signer's. Contact then lands by construction - for any signer,
+# and for any rig whose landmarks are measured.
+#
+# Away from the body there is nothing to anchor to and nothing to get wrong, so
+# the raw position is kept and the two are blended in between. A hard switch
+# would jump the hand the moment the nearest landmark changed.
+
+# The rig's own landmarks, measured from tarjuman/public/last.glb by
+# `npm run measurerig`, in this file's units (shoulder width = 1, origin on the
+# shoulder line, +y DOWN). Same five names, same order, as ANCHOR_NAMES in
+# feature_extractor.py - they are matched by name, so the order only has to
+# agree with itself.
+#
+# `shoulder` and `chest` are definitions rather than measurements: the feature
+# extractor places them at the dominant shoulder and at 0.35 below the shoulder
+# line for every signer, so the rig uses the same two points and they cancel.
+RIG_ANCHORS = {
+    "nose":     (0.00, -0.736),   # tip of the nose: the head's most forward point
+    "mouth":    (0.00, -0.590),   # from the face mesh
+    "ear":      (0.00, -0.671),   # midpoint of the ears = head centre, ear height
+    "shoulder": (-0.50, 0.000),   # by definition
+    "chest":    (0.00, 0.350),    # by definition
+}
+
+# The rig's chin, for reference when reading the numbers above: y = -0.297.
+
+# How near a landmark the hand must come before it is anchored to it at all,
+# and where the anchoring becomes total. In shoulder widths.
+#
+# 0.75 is about the width of a hand plus a little: close enough that the signer
+# was plainly aiming at that landmark. 0.35 is roughly touching. Between them
+# the two placements are mixed, so the hand slides onto the landmark instead of
+# snapping to it.
+ANCHOR_NEAR = 0.75
+ANCHOR_LOCK = 0.35
+
+
+def anchors_from_sequence(seq, anchor_names=None) -> dict:
+    """
+    Recover the signer's own landmark positions from a recorded sequence.
+
+    The dataset stores, for each hand in each frame, the wrist in body
+    coordinates AND its distance to each of the five landmarks. It does not
+    store where those landmarks were. But a point at a known distance from an
+    unknown one describes a circle, and thirty frames of a moving hand describe
+    thirty circles that meet in one place. So the landmarks can be read back out
+    of the distances, with no change to the dataset format and nothing to
+    re-record.
+
+    Subtracting one frame's equation from the others turns the circles into
+    lines, which is a least-squares solve rather than an iteration:
+
+        |p_k - a|^2 = d_k^2   ->   2(p_k - p_0)·a = |p_k|^2 - |p_0|^2 - d_k^2 + d_0^2
+
+    Returns {} when a sign has too few usable frames - a one-frame hand gives
+    one circle, and a circle is not a point. The caller then keeps the raw
+    coordinates, which is exactly the old behaviour.
+    """
+    import numpy as _np
+    from tarjuman_core.feature_extractor import (
+        ANCHOR_NAMES, N_ANCHORS, VALS_PER_HAND)
+
+    names = anchor_names or ANCHOR_NAMES
+    seq = _np.asarray(seq, dtype=_np.float64)
+    if seq.ndim != 2:
+        return {}
+
+    # Every (wrist, distances) pair the sequence offers, from both hands.
+    points, dists = [], []
+    for hand in (0, 1):
+        base = hand * VALS_PER_HAND
+        block = seq[:, base:base + VALS_PER_HAND]
+        if block.shape[1] < VALS_PER_HAND:
+            continue
+        present = _np.any(block != 0.0, axis=1)
+        d = block[:, VALS_PER_HAND - N_ANCHORS:]
+        # A hand exactly on a landmark gives distance 0 for it, which is fine;
+        # a row of all zeros means the hand was absent, which is not.
+        usable = present & _np.any(d != 0.0, axis=1)
+        if not usable.any():
+            continue
+        points.append(block[usable][:, :2])
+        dists.append(d[usable])
+    if not points:
+        return {}
+    P = _np.vstack(points)
+    D = _np.vstack(dists)
+
+    out = {}
+    for i, name in enumerate(names):
+        d = D[:, i]
+        keep = d > 0.0
+        p, dk = P[keep], d[keep]
+        # Three non-collinear circles are the minimum; ask for more so noise in
+        # any one frame cannot decide the answer.
+        if len(p) < 6:
+            continue
+        p0, d0 = p[0], dk[0]
+        A = 2.0 * (p[1:] - p0)
+        b = ((p[1:] ** 2).sum(axis=1) - (p0 ** 2).sum()
+             - dk[1:] ** 2 + d0 ** 2)
+        try:
+            sol, *_ = _np.linalg.lstsq(A, b, rcond=None)
+            sv = _np.linalg.svd(A, compute_uv=False)
+        except _np.linalg.LinAlgError:
+            continue
+        if not _np.all(_np.isfinite(sol)):
+            continue
+
+        # Does the hand's path actually pin the landmark down in BOTH
+        # directions? A wrist travelling in a straight line - which is most of
+        # what a sign does - gives circles whose centres lie along that line,
+        # and they intersect along a ridge rather than at a point. Least squares
+        # answers anyway, confidently and wrongly. The ratio of A's singular
+        # values is exactly how much shorter the ridge's narrow direction is,
+        # so it is the test: below 5% the geometry has not decided, and a
+        # bounding box would not have noticed (a straight path has a perfectly
+        # respectable one).
+        if sv[-1] <= 0 or sv[-1] / sv[0] < 0.05:
+            continue
+
+        # And having solved, check the answer against the distances it came
+        # from. Least squares always returns something; only the residual says
+        # whether it fits. 0.05 shoulder widths is about a finger's width.
+        resid = _np.abs(_np.linalg.norm(p - sol, axis=1) - dk)
+        if float(_np.median(resid)) > 0.05:
+            continue
+
+        out[name] = (float(sol[0]), float(sol[1]))
+    return out
+
+
+def _anchor_shift(wrist_xy, distances, human_anchors, anchor_names) -> tuple:
+    """
+    How far to move this frame's hand so it sits on the rig's landmark instead
+    of the signer's. Returns (dx, dy); (0, 0) when nothing is near enough.
+
+    The nearest landmark is read straight from the stored distances rather than
+    recomputed, so this agrees exactly with the feature the recogniser was
+    trained on.
+    """
+    best_i, best_d = -1, 1e9
+    for i, name in enumerate(anchor_names):
+        if name not in human_anchors or name not in RIG_ANCHORS:
+            continue
+        d = float(distances[i])
+        if d < best_d:
+            best_i, best_d = i, d
+    if best_i < 0 or best_d >= ANCHOR_NEAR:
+        return 0.0, 0.0
+
+    name = anchor_names[best_i]
+    hx, hy = human_anchors[name]
+    rx, ry = RIG_ANCHORS[name]
+
+    # 1 at the landmark, falling to 0 at ANCHOR_NEAR. Smoothstep rather than a
+    # straight ramp so the hand does not visibly change direction at either end.
+    t = (ANCHOR_NEAR - best_d) / max(1e-6, ANCHOR_NEAR - ANCHOR_LOCK)
+    t = min(1.0, max(0.0, t))
+    t = t * t * (3.0 - 2.0 * t)
+    return t * (rx - hx), t * (ry - hy)
+
+
+def frame_to_bone_dirs(frame, anchors=None) -> dict:
     """
     One feature frame -> {boneName: [...]} for every bone it drives.
 
     Values are three numbers (a direction) except hand bones, which carry six
     (direction + palm normal). The player tells them apart by length.
+
+    `anchors` is the signer's own landmark positions, {name: (x, y)} in body
+    coordinates - from `anchors_from_sequence` for a recording, or from a live
+    `BodyAnchors.points`. Given them, a hand near a landmark is placed on the
+    RIG's matching landmark instead of at the signer's raw coordinates, so
+    signs that touch the face arrive where they mean to. Without them the raw
+    coordinates are used, which is what this function always did.
     """
-    from tarjuman_core.feature_extractor import VALS_PER_HAND
+    from tarjuman_core.feature_extractor import VALS_PER_HAND, ANCHOR_NAMES, N_ANCHORS
 
     pose = {}
     frame = np.asarray(frame, dtype=np.float32)
@@ -472,7 +786,24 @@ def frame_to_bone_dirs(frame) -> dict:
         if not np.any(block):
             continue
         pts = hand_points(block)
-        pose.update(arm_directions(hand_centre(block), side))
+        # إلى أين تشير الأصابع فعلاً (فضاء الجسم)؟ الذراع تُحَلّ وهي تعرف ذلك،
+        # فتُدفَع إلى الأمام بما يكفي لتخرج الأصابع لا المعصم وحده.
+        axis = np.asarray(unit(pts[MIDDLE_MCP] - pts[0]), dtype=np.float64)
+        thumb = np.asarray(unit(pts[4] - pts[0]), dtype=np.float64)
+
+        target = np.asarray(hand_centre(block), dtype=np.float64).copy()
+        if anchors:
+            # The whole hand moves together: shifting the IK target without
+            # shifting the fingers would tear the two apart.
+            dx, dy = _anchor_shift(block[:2], block[VALS_PER_HAND - N_ANCHORS:],
+                                   anchors, ANCHOR_NAMES)
+            target[0] += dx
+            target[1] += dy
+
+        pose.update(arm_directions(target, side,
+                                   tip_offset=axis * HAND_REACH,
+                                   thumb_offset=thumb * HAND_REACH * 0.75))
         pose.update(hand_directions(pts, side))
         pose.update(finger_directions(pts, side))
-    return pose
+    # الأرقام مُحلّةٌ في اصطلاح المرجع؛ الأسماء وحدها تُنقل إلى اصطلاح الهيكل.
+    return _relabel_sides(pose)

@@ -108,6 +108,9 @@ VOCABULARY = [
     ("q_why",         "لماذا؟",        "index", "temple",     "forward",   "in",   1, False),
     ("q_how",         "كيف؟",          "cup",   "neutral",    "circular",  "up",   2, False),
     ("q_howmuch",     "كم؟",           "pinch", "neutral",    "shake",     "up",   1, False),
+    ("q_name",        "ما اسمك؟",      "index", "neutral",    "forward",   "in",   1, False),
+    ("q_how_are_you", "كيف حالك؟",     "flat",  "chest",      "outward",   "up",   2, False),
+    ("my_name",       "اسمي",      "index", "chest",      "tap",       "in",   1, False),
 
     # -- ضمائر وأشخاص --------------------------------------------------------
     ("i_me",          "أنا",           "index", "chest",      "tap",       "in",   1, False),

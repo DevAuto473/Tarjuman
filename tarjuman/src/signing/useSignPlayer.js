@@ -166,7 +166,15 @@ function depthOf(bone) {
 
 export function useSignPlayer({ scene, actions, enabled = true }) {
   const bonesRef = useRef(new Map());       // boneName -> THREE.Bone
-  const restRef = useRef(new Map());        // boneName -> rest quaternion
+  const restRef = useRef(new Map());        // boneName -> bind (rest) quaternion
+  // boneName -> وضعية السكون: أوّل إطار من مقطع Robot_Idle.
+  //
+  // ولماذا لا نكتفي بوضعية الارتباط؟ لأنّ وضعية ارتباط هذا الهيكل هي T-pose:
+  // قياساً، اتجاه UpperArmL فيها (-1, 0, 0) — أفقيّ تماماً إلى الجنب. فكلّ
+  // عظمة لا تذكرها الإشارة كانت ترتدّ إلى تلك الوضعية، فتنطلق الذراع الأخرى
+  // إلى الأفق في كل حركة. أوّل إطار من مقطع السكون يعطي (-0.28, -0.96, 0.04)
+  // — ذراعٌ مسترخية إلى جانب الجسم، وهي المرجع الصحيح.
+  const neutralRef = useRef(new Map());
   // boneName -> unit vector the bone points along in its OWN local space.
   // Taken from the child's rest offset, which IS the bone's direction.
   const restDirRef = useRef(new Map());
@@ -178,6 +186,8 @@ export function useSignPlayer({ scene, actions, enabled = true }) {
   const blendRef = useRef(0);               // 0 = idle, 1 = fully signing
   const signingRef = useRef(false);         // guards the setSigning setter
   const clipsPausedRef = useRef(null);      // tracks the mixer pause state
+  // المقاطع التي كانت تعمل لحظةَ الإيقاف — وهي وحدها ما يُستأنَف.
+  const resumeSetRef = useRef(null);
   const liveRef = useRef(false);            // live mirror is driving the bones
   const scratchA = useRef(new THREE.Quaternion());
   const scratchB = useRef(new THREE.Quaternion());
@@ -262,6 +272,47 @@ export function useSignPlayer({ scene, actions, enabled = true }) {
         + `${restNormals.size} with a palm normal`);
     }
   }, [scene]);
+
+  // ── وضعية السكون، مستخرَجة من مقطع الهيكل نفسه ────────────────────────────
+  //
+  // تُقرأ من مسارات المقطع مباشرةً (قيم الإطار الأوّل) لا بتشغيله على المشهد،
+  // فلا يُمَسّ الهيكل ولا يتعارض هذا مع المازج. وإن لم يوجد مقطع سكون بقيت
+  // الخريطة فارغة، فيرجع كلُّ شيء إلى وضعية الارتباط كما كان.
+  useEffect(() => {
+    const map = new Map();
+    const clips = actions
+      ? Object.values(actions).map((a) => a?.getClip?.()).filter(Boolean)
+      : [];
+    const idle = clips.find((c) => /idle|stand|rest/i.test(c.name)) || clips[0];
+
+    if (idle) {
+      for (const track of idle.tracks) {
+        if (!track.name.endsWith('.quaternion') || track.values.length < 4) continue;
+        const boneName = track.name.slice(0, -'.quaternion'.length);
+        const q = new THREE.Quaternion(
+          track.values[0], track.values[1], track.values[2], track.values[3]);
+        map.set(boneName, q);
+        const key = normaliseBoneName(boneName);
+        if (key !== boneName) map.set(key, q.clone());
+      }
+      console.log(`[signing] neutral pose from "${idle.name}" (${map.size} bones)`);
+    } else {
+      console.warn('[signing] no idle clip — falling back to the bind pose, '
+        + 'which on a T-posed rig throws the unused arm out sideways.');
+    }
+    neutralRef.current = map;
+  }, [actions]);
+
+  /** وضعية السكون لعظمة، وإلّا وضعية الارتباط. */
+  const neutralOf = useCallback((name, bone) => {
+    const key = normaliseBoneName(name);
+    return neutralRef.current.get(name)
+      || neutralRef.current.get(key)
+      || (bone && (neutralRef.current.get(bone.name)
+        || neutralRef.current.get(normaliseBoneName(bone.name))))
+      || restRef.current.get(name)
+      || restRef.current.get(key);
+  }, []);
 
   // ── Public API ────────────────────────────────────────────────────────────
 
@@ -375,21 +426,42 @@ export function useSignPlayer({ scene, actions, enabled = true }) {
       0, 1
     );
 
-    // Keep the idle clip out of the way while the sign drives the bones.
-    // Weight alone is not enough — a running action still writes to the
-    // skeleton, and whichever runs last wins. Every clip is paused outright
-    // while signing, then resumed.
+    // يُبعَد مقطع السكون عن الطريق ما دامت الإشارة تقود العظام. الوزن وحده
+    // لا يكفي: المقطع الشغّال يكتب في الهيكل على أي حال، والأخير يفوز — فيُوقَف
+    // إيقافاً صريحاً ثمّ يُستأنَف.
+    //
+    // ⚠️  يُستأنَف ما أوقفناه نحن فقط، ولا شيء غيره.
+    // الملفّ يحوي مقطعين: Robot_Idle و Robot_Talk. وكان الاستئناف يشغّل كلّ
+    // مقطعٍ لا يعمل، فيُطلِق Robot_Talk بعد أوّل إشارة ولا يتوقّف — فيبقى
+    // الروبوت يثرثر بلا مناسبة. ومجموعةُ ما كان يعمل تُلتقط قبل الإيقاف،
+    // لأنّ isRunning() تصير false بمجرّد ضبط paused.
     const clips = actions ? Object.values(actions) : [];
     const wantPaused = !!active || liveRef.current;
     if (clipsPausedRef.current !== wantPaused) {
       clipsPausedRef.current = wantPaused;
-      for (const a of clips) {
-        if (!a) continue;
-        a.paused = wantPaused;
-        a.setEffectiveWeight(wantPaused ? 0 : 1);
-        if (!wantPaused && !a.isRunning()) a.play();
+
+      if (wantPaused) {
+        resumeSetRef.current = new Set(clips.filter((a) => a && a.isRunning()));
+        for (const a of clips) {
+          if (!a) continue;
+          a.paused = true;
+          a.setEffectiveWeight(0);
+        }
+        console.log(`[signing] clips paused (${resumeSetRef.current.size}`
+          + `/${clips.length} were running)`);
+      } else if (resumeSetRef.current) {
+        // لم نوقف شيئاً بعد (resumeSetRef فارغة) => لا نلمس شيئاً. هذا ما
+        // يمنع تشغيل Talk عند أوّل تحديث بعد الإقلاع أيضاً.
+        let resumed = 0;
+        for (const a of clips) {
+          if (!a || !resumeSetRef.current.has(a)) continue;
+          a.paused = false;
+          a.setEffectiveWeight(1);
+          if (!a.isRunning()) a.play();
+          resumed += 1;
+        }
+        console.log(`[signing] clips resumed (${resumed}/${clips.length})`);
       }
-      console.log(`[signing] clips ${wantPaused ? 'paused' : 'resumed'} (${clips.length})`);
     }
 
     // While the mirror is driving the bones, the keyframe path must keep its
@@ -402,11 +474,12 @@ export function useSignPlayer({ scene, actions, enabled = true }) {
         setSigning(false);
         setCurrentWord(null);
       }
-      // Ease bones back to rest while blending out
+      // العودة إلى وضعية السكون — لا إلى وضعية الارتباط. الفرق بينهما هو
+      // الفرق بين ذراعٍ تهبط إلى جانب الجسم وذراعٍ تنفرد أفقياً.
       if (blendRef.current > 0.001) {
         for (const [name, bone] of bones) {
-          const restQ = rest.get(name);
-          if (restQ) bone.quaternion.slerp(restQ, 1 - blendRef.current);
+          const target = neutralOf(name, bone);
+          if (target) bone.quaternion.slerp(target, 1 - blendRef.current);
         }
       }
       return;
@@ -427,9 +500,18 @@ export function useSignPlayer({ scene, actions, enabled = true }) {
     }
     const span = Math.max(1e-6, b.t - a.t);
     const localT = THREE.MathUtils.clamp((t - a.t) / span, 0, 1);
-    // Smoothstep: real gestures accelerate and decelerate, they do not move
-    // at a constant speed between poses.
-    const eased = localT * localT * (3 - 2 * localT);
+
+    // كيف نصل بين مفتاحين؟ الجواب يعتمد على كثافة المفاتيح، لا على ذوقٍ عام.
+    //
+    //   • مفاتيح مكتوبة يدوياً (ثلاثة أو أربعة): منحنى تنعيم. الحركة الحقيقية
+    //     تتسارع وتتباطأ، والوصلُ الخطّي بين وضعين متباعدين يبدو آلياً.
+    //
+    //   • مفاتيح مسجَّلة (ثلاثون، كلّ 1/30 من الإشارة): خطّي. التسارع موجودٌ
+    //     في البيانات نفسها. وتطبيقُ التنعيم على كل مفتاحٍ يعني التباطؤَ
+    //     والتسارعَ ثلاثين مرّة في الثانية والنصف — وهو بالضبط ما جعل
+    //     الروبوت يبدو آلياً أكثر ممّا ينبغي، ويمحو السكنات.
+    const linear = active.sign.easing === 'linear';
+    const eased = linear ? localT : localT * localT * (3 - 2 * localT);
 
     // ── Apply every bone mentioned by either keyframe ───────────────────────
     const touched = new Set([...Object.keys(a.pose), ...Object.keys(b.pose)]);
@@ -468,9 +550,13 @@ export function useSignPlayer({ scene, actions, enabled = true }) {
         const to = b.pose[name] ? eulerDegToQuat(b.pose[name], scratchB.current)
                                 : scratchB.current.identity();
 
-        // Interpolate the OFFSET, then apply it on top of the rest rotation.
+        // يُدمج الإزاحة ثمّ يطبّقها فوق وضعية السكون لا وضعية الارتباط.
+        // زوايا `poses.js` مكتوبة على أساس أنّ الصفر يعني «الذراع مسترخية»
+        // (ولذلك سُمّيت الوضعية `rest`)، وهذا ما يجعل الصفر يعني ذلك فعلاً.
+        // وعلى الأساس القديم كانت كل إشارة تبدأ من T-pose ثم تنزل منها.
         scratchOut.current.copy(from).slerp(to, eased);
-        bone.quaternion.copy(restQ).multiply(scratchOut.current);
+        bone.quaternion.copy(neutralOf(name, bone) || restQ)
+          .multiply(scratchOut.current);
       }
     }
 
@@ -481,15 +567,15 @@ export function useSignPlayer({ scene, actions, enabled = true }) {
     const touchedBones = new Set(ordered.map((n) => resolve(n)).filter(Boolean));
     for (const [name, bone] of bones) {
       if (touchedBones.has(bone)) continue;
-      const restQ = rest.get(name);
-      if (restQ) bone.quaternion.slerp(restQ, Math.min(1, delta * 8));
+      const target = neutralOf(name, bone);
+      if (target) bone.quaternion.slerp(target, Math.min(1, delta * 8));
     }
 
     if (t >= 1) {
       currentRef.current = null;
       if (queueRef.current.length === 0) setCurrentWord(null);
     }
-  }, [actions, enabled, signing, solveBone]);
+  }, [actions, enabled, signing, solveBone, neutralOf]);
 
   return {
     playSigns,

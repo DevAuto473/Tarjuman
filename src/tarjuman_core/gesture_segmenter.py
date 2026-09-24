@@ -43,6 +43,7 @@ from tarjuman_core.feature_extractor import (
     VALS_PER_FRAME,
     VALS_PER_HAND,
     WRIST_IDX,
+    clean_take,
     compute_global_features,
 )
 
@@ -430,6 +431,23 @@ class GestureSegmenter:
         duration = ((stamps[-1] - stamps[0]) if len(stamps) >= 2
                     else len(captured) / self.fps)
         duration = max(duration, 1e-3)
+
+        # Clean the capture BEFORE anything is measured from it.
+        #
+        # This is the only place a take is finalised, and both the recorder and
+        # the live server come through here — which is exactly why the cleaning
+        # belongs here and nowhere else. Doing it in the recorder alone would
+        # train the model on repaired takes and then ask it to recognise raw
+        # ones: the same silent train/inference mismatch that the fixed capture
+        # window used to cause.
+        #
+        # `clean_take` fills brief tracking dropouts and takes the tremor out of
+        # the landmarks. Both matter more than they look, because the globals
+        # below are measured on these raw frames on purpose — so a dropout that
+        # writes 68 zeros, or a jitter spike, is read as the sign's own speed.
+        # A fully absent hand is left as zeros, so one-handed signs are encoded
+        # exactly as before.
+        captured = clean_take(captured, fps=self.fps)
 
         # Globals are computed on the RAW capture — resampling would erase them
         globals_ = compute_global_features(captured, duration)

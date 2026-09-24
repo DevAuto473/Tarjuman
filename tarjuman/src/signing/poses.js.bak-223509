@@ -1,0 +1,184 @@
+/**
+ * poses.js — reusable hand shapes for the Tarjuman robot
+ * =======================================================
+ * Bone names come straight from the rig inside TarjumanRobot2.glb
+ * (skin "Robot_Rig", 57 joints, standard Blender .L/.R naming).
+ *
+ * Why a pose LIBRARY instead of one animation per word
+ * ----------------------------------------------------
+ * Sign language reuses a small set of hand shapes over and over — a fist, a
+ * flat palm, a pointing index. Authoring a separate Blender animation per word
+ * would re-model those same shapes hundreds of times. Here each shape is
+ * defined ONCE as data, and a word becomes "hand shape X carried along arm
+ * path Y". Adding a word is then a few lines of JSON, not a modelling session.
+ *
+ * Rotation convention
+ * -------------------
+ * Every value is [x, y, z] Euler angles in DEGREES, applied in the bone's own
+ * local space, relative to its rest pose. Degrees (not radians) because these
+ * numbers are meant to be hand-tuned by a human.
+ *
+ * ⚠️  انحناءات الأصابع أدناه تقديرات، تُضبط بالعين من لوحة المعايرة.
+ *     أمّا زوايا الذراع فلم تعد كذلك: حُلَّت عددياً على هذا الهيكل بعينه
+ *     (انظر ARM_POSITIONS). محاور عظام Blender اعتباطية، ولهذا كان الحلّ
+ *     العددي هو السبيل الوحيد إلى أرقام صحيحة.
+ */
+
+// ── Bone name constants ──────────────────────────────────────────────────────
+// Centralised so a rig rename breaks in ONE place instead of silently
+// producing a robot that simply never moves.
+export const BONES = {
+  root: 'Root',
+  hips: 'Hips',
+  spine: 'Spine',
+  chest: 'Chest',
+  neck: 'Neck',
+  head: 'Head',
+  jaw: 'Jaw',
+  shoulder: (s) => `Shoulder.${s}`,
+  upperArm: (s) => `UpperArm.${s}`,
+  lowerArm: (s) => `LowerArm.${s}`,
+  hand: (s) => `Hand.${s}`,
+  finger: (name, seg, s) => `${name}.0${seg}.${s}`,
+};
+
+export const FINGERS = ['thumb', 'index', 'middle', 'ring', 'pinky'];
+export const SIDES = ['L', 'R'];
+
+/**
+ * Build the finger-bone rotations for one hand from a per-finger curl amount.
+ *
+ * @param {Object} curls  e.g. { index: 0, middle: 1, thumb: 0.5 }
+ *                        0 = fully extended, 1 = fully curled
+ * @param {string} side   'L' or 'R'
+ */
+export function fingerPose(curls, side) {
+  const pose = {};
+  for (const finger of FINGERS) {
+    const curl = curls[finger] ?? 0;
+    // Each successive joint bends a little more, which is what a real finger
+    // does — the tip curls further than the knuckle.
+    const perSegment = finger === 'thumb'
+      ? [-45 * curl, -35 * curl, -30 * curl]
+      : [-80 * curl, -70 * curl, -55 * curl];
+
+    for (let seg = 1; seg <= 3; seg++) {
+      pose[BONES.finger(finger, seg, side)] = [perSegment[seg - 1], 0, 0];
+    }
+  }
+  return pose;
+}
+
+// ── Hand shape library ───────────────────────────────────────────────────────
+// Curl amounts per finger: 0 = straight, 1 = fully closed.
+export const HAND_SHAPES = {
+  flat:    { thumb: 0.0, index: 0.0, middle: 0.0, ring: 0.0, pinky: 0.0 },
+  fist:    { thumb: 0.9, index: 1.0, middle: 1.0, ring: 1.0, pinky: 1.0 },
+  point:   { thumb: 0.8, index: 0.0, middle: 1.0, ring: 1.0, pinky: 1.0 },
+  peace:   { thumb: 0.9, index: 0.0, middle: 0.0, ring: 1.0, pinky: 1.0 },
+  thumbUp: { thumb: 0.0, index: 1.0, middle: 1.0, ring: 1.0, pinky: 1.0 },
+  pinch:   { thumb: 0.5, index: 0.5, middle: 1.0, ring: 1.0, pinky: 1.0 },
+  cup:     { thumb: 0.4, index: 0.4, middle: 0.4, ring: 0.4, pinky: 0.4 },
+  open5:   { thumb: 0.1, index: 0.1, middle: 0.1, ring: 0.1, pinky: 0.1 },
+};
+
+/** Convenience: full finger rotation map for a named shape. */
+export function handShape(shapeName, side) {
+  const curls = HAND_SHAPES[shapeName];
+  if (!curls) {
+    console.warn(`[signing] unknown hand shape: ${shapeName}`);
+    return {};
+  }
+  return fingerPose(curls, side);
+}
+
+// ── Arm positions ────────────────────────────────────────────────────────────
+// أين تقف اليد في الفضاء. لغة الإشارة شديدة الاعتماد على الموضع (الصدر مقابل
+// الوجه مقابل الفضاء المحايد)، فالتسمية بالموضع لا بالزاوية.
+//
+// من أين جاءت هذه الأرقام
+// ------------------------
+// لم تعد تقديرات. قِيس الجسم من شبكات `TarjumanRobot2.glb` نفسها (الجذع
+// x∈[-0.59,0.25] y∈[1.83,3.34] z∈[-0.38,0.39]، والرأس فوقه)، ثمّ حُدّد لكل
+// موضع هدفٌ أمام ذلك السطح، وحُلَّت ذراعٌ بعظمتين (IK) تصل إليه مع مرفقٍ
+// موجَّه إلى الخارج والأسفل، ثمّ حُوّل الحلّ إلى إزاحات أويلر عن وضعية
+// السكون. خطأ الوصول 0.000 في المواضع العشرة كلّها، ولا يقع الكفّ داخل
+// الجسم في أيٍّ منها.
+//
+// ولماذا كان لا بدّ من ذلك: الأرقام السابقة كانت تُرجِع اليد اليمنى إلى
+// x = -0.38 بينما منتصف الجسم عند x = -0.17 — أي أنّ اليد كانت تعبر الصدر
+// إلى الجهة الأخرى وتغرز فيه. إشارة الوجه كانت تضع الكفّ داخل الرأس.
+//
+// اليمين واليسار غير متماثلين عمداً: وضعية السكون نفسها في هذا الهيكل غير
+// متماثلة (ShoulderL و ShoulderR يحملان دورانين مختلفين)، فالمرآة الحسابية
+// كانت ستُنتج ذراعاً يسرى مزحزحة.
+//
+// ⚠️  إن استُبدل ملفّ الهيكل، أعِد الحلّ — هذه الأرقام تخصّ هذا الهيكل وحده.
+//     ولوحة المعايرة تبقى الطريق لضبطها بالعين بعد ذلك.
+const ARM_SOLVED = {
+  chest:    { R: { u: [ 10.0,  -0.1, -28.2], l: [-34.3,  40.3,  -70.1] },
+              L: { u: [ 10.3,   6.8,  23.9], l: [-39.5, -30.8,   61.2] } },
+  face:     { R: { u: [ 64.5, -21.5, -70.9], l: [ 28.3, -11.3,  -79.0] },
+              L: { u: [ 67.7,  21.7,  62.3], l: [ 30.3,   8.5,   67.2] } },
+  forehead: { R: { u: [100.8, -43.8, -64.5], l: [ 30.7,  -5.6,  -35.7] },
+              L: { u: [106.6,  39.1,  55.8], l: [ 31.6,   2.5,   24.1] } },
+  outward:  { R: { u: [ 48.6, -12.1, -20.2], l: [ 19.2,  -3.9,  -94.6] },
+              L: { u: [ 50.4,  14.7,  12.4], l: [ 20.0,   3.1,   82.7] } },
+  side:     { R: { u: [ 46.2, -14.6,  31.3], l: [ 18.4,  -3.8, -108.7] },
+              L: { u: [ 48.4,  17.5, -39.1], l: [ 19.2,   3.2,   96.7] } },
+};
+
+/** يبني خريطة العظام لموضعٍ محلول. */
+function solvedArm(name) {
+  return (side) => {
+    const a = ARM_SOLVED[name][side];
+    return {
+      // الكتف يبقى في وضعية السكون: الحلّ لم يحتج تحريكه، وتدويره كان
+      // يزحزح مفصل الكتف عن مكانه في الجسم.
+      [BONES.shoulder(side)]: [0, 0, 0],
+      [BONES.upperArm(side)]: a.u,
+      [BONES.lowerArm(side)]: a.l,
+    };
+  };
+}
+
+export const ARM_POSITIONS = {
+  // صفرٌ في كل شيء = وضعية السكون تماماً: ذراعٌ مسترخية إلى جانب الجسم.
+  // (كانت تعني وضعية الارتباط، وهي في هذا الهيكل T-pose — ذراعٌ أفقية.)
+  rest: (s) => ({
+    [BONES.shoulder(s)]: [0, 0, 0],
+    [BONES.upperArm(s)]: [0, 0, 0],
+    [BONES.lowerArm(s)]: [0, 0, 0],
+  }),
+  chest:    solvedArm('chest'),
+  face:     solvedArm('face'),
+  forehead: solvedArm('forehead'),
+  outward:  solvedArm('outward'),
+  side:     solvedArm('side'),
+};
+
+/**
+ * Compose one full keyframe pose.
+ *
+ * @param {Object} spec
+ *   arm   : { R: 'chest', L: 'rest' }      — position name per side
+ *   hand  : { R: 'flat',  L: 'fist' }      — hand shape per side
+ *   head  : [x, y, z]                      — optional head tilt
+ *   extra : { 'BoneName': [x,y,z] }        — manual overrides, applied last
+ */
+export function composePose({ arm = {}, hand = {}, head, extra = {} } = {}) {
+  let pose = {};
+
+  for (const side of SIDES) {
+    const position = arm[side];
+    if (position && ARM_POSITIONS[position]) {
+      pose = { ...pose, ...ARM_POSITIONS[position](side) };
+    }
+    const shape = hand[side];
+    if (shape) pose = { ...pose, ...handShape(shape, side) };
+  }
+
+  if (head) pose[BONES.head] = head;
+
+  return { ...pose, ...extra };
+}

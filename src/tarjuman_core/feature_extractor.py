@@ -71,7 +71,7 @@ close — removes SCALE too, so the same sign reads the same at 0.5 m and 1.5 m.
 No information is lost: absolute distance is still available from the raw wrist
 coordinates and from estimate_distance().
 
-Sequence:   SEQUENCE_LENGTH (30) frames × 126 = 3 780 features per sample.
+Sequence:   SEQUENCE_LENGTH (30) frames × 144 = 4 320 features per sample.
 
 Mirroring (important)
 ---------------------
@@ -81,6 +81,7 @@ inference and the model silently learns the wrong hand. `MIRROR_FRAME` below
 is the single switch that guarantees this; use `prepare_frame()` everywhere.
 """
 
+import os as _os
 import numpy as np
 
 # OpenCV is deliberately NOT imported at module level. This module is imported
@@ -124,13 +125,13 @@ N_ANCHORS    = len(ANCHOR_NAMES)                        # 5
 HAND_SHAPE_VALS  = (N_HAND_LANDMARKS - 1) * COORDS_PER_LM   # 60
 VALS_PER_HAND    = COORDS_PER_LM + HAND_SHAPE_VALS + N_ANCHORS   # 3 + 60 + 5 = 68
 
-# Body block: shoulder width, face size, torso tilt, pose-detected flag.
-BODY_BLOCK_VALS  = 4
+# Body block: shoulder width, face size, torso tilt, pose-detected flag, plus 4 face features (head yaw, head pitch, mouth width, mouth pitch).
+BODY_BLOCK_VALS  = 8
 
-VALS_PER_FRAME   = VALS_PER_HAND * 2 + BODY_BLOCK_VALS  # 140
+VALS_PER_FRAME   = VALS_PER_HAND * 2 + BODY_BLOCK_VALS  # 144
 
 SEQUENCE_LENGTH  = 30
-FRAME_FEATURES   = VALS_PER_FRAME * SEQUENCE_LENGTH     # 3 780
+FRAME_FEATURES   = VALS_PER_FRAME * SEQUENCE_LENGTH     # 4 320
 
 # -- Global (whole-gesture) features ------------------------------------------
 # Appended once per sample, AFTER the per-frame block.
@@ -163,7 +164,7 @@ GLOBAL_FEATURE_NAMES = (
 )
 N_GLOBAL_FEATURES = len(GLOBAL_FEATURE_NAMES)           # 12
 
-TOTAL_FEATURES   = FRAME_FEATURES + N_GLOBAL_FEATURES   # 3 792
+TOTAL_FEATURES   = FRAME_FEATURES + N_GLOBAL_FEATURES   # 4 332
 
 WRIST_IDX        = 0
 MIDDLE_MCP_IDX   = 9                       # used as a stable hand-size proxy
@@ -276,6 +277,7 @@ class PoseTracker:
         self._every_n = max(1, int(every_n))
         self._counter = 0
         self._anchors = BodyAnchors()
+        self.last_results = None
 
     def update(self, rgb_frame) -> "BodyAnchors":
         """
@@ -287,7 +289,9 @@ class PoseTracker:
         if self._counter % self._every_n == 0:
             try:
                 results = self._pose.process(rgb_frame)
-                self._anchors = BodyAnchors.from_pose(results)
+                self.last_results = results
+                h, w = rgb_frame.shape[:2]
+                self._anchors = BodyAnchors.from_pose(results, aspect=h / w)
             except Exception as exc:
                 print(f"[PoseTracker] pose failed: {type(exc).__name__}: {exc}")
         self._counter += 1
@@ -320,29 +324,69 @@ class BodyAnchors:
     rather than silently feeding it a different coordinate space.
     """
 
-    __slots__ = ("valid", "origin", "scale", "points", "face_size", "tilt")
+    __slots__ = ("valid", "origin", "scale", "points", "face_size", "tilt",
+                 "head_yaw", "head_pitch", "mouth_width", "mouth_pitch",
+                 "aspect")
 
     def __init__(self):
         self.valid = False
         self.origin = np.zeros(2, dtype=np.float32)
         self.scale = 1.0
+        # height / width of the frame these landmarks came from. See from_pose.
+        self.aspect = 1.0
         self.points = {}          # name -> (x, y) in body coordinates
         self.face_size = 0.0
         self.tilt = 0.0
+        self.head_yaw = 0.0
+        self.head_pitch = 0.0
+        self.mouth_width = 0.0
+        self.mouth_pitch = 0.0
 
     # -- Construction --------------------------------------------------------
 
     @classmethod
-    def from_pose(cls, pose_results) -> "BodyAnchors":
+    def from_pose(cls, pose_results, aspect: float = 1.0) -> "BodyAnchors":
+        """
+        Build the body frame from a Pose result.
+
+        `aspect` is the frame's HEIGHT / WIDTH, and it is not optional in
+        practice — passing the default of 1.0 is only correct for a square
+        frame, which no camera produces.
+
+        Why it is needed
+        ----------------
+        MediaPipe normalises `lm.x` by the image WIDTH and `lm.y` by its
+        HEIGHT. On a 640x480 frame one unit of x spans 640 px and one unit of y
+        spans 480, so the two axes are not the same length and the coordinates
+        are not isotropic: the same physical distance reads 1.33x larger
+        vertically than horizontally.
+
+        Everything downstream then divides BOTH axes by `scale`, the shoulder
+        width - a purely HORIZONTAL measurement. So every vertical distance in
+        this pipeline was overstated by width/height. The chin was recorded a
+        third higher above the shoulders than it really sits, and the avatar,
+        told to put its hand where the recording said, put it somewhere else.
+        Worse, the error changes with the camera: the same sign shot at 16:9
+        produced different numbers than at 4:3, so the recogniser was learning
+        part of the lens.
+
+        Multiplying y by height/width here restores square units - x and y then
+        both measure in image WIDTHS - and every distance, angle and anchor
+        below inherits that. Callers must hand hand landmarks through the same
+        correction; `extract_hand_features` does it from `self.aspect`.
+        """
         a = cls()
         if pose_results is None or not getattr(pose_results, "pose_landmarks", None):
             return a
 
+        aspect = float(aspect) if aspect and aspect > 0 else 1.0
+        a.aspect = aspect
         lms = pose_results.pose_landmarks.landmark
 
         def pt(i):
             lm = lms[i]
-            return np.array([lm.x, lm.y], dtype=np.float32), getattr(lm, "visibility", 1.0)
+            return (np.array([lm.x, lm.y * aspect], dtype=np.float32),
+                    getattr(lm, "visibility", 1.0))
 
         sh_l, vis_l = pt(POSE_SHOULDER_L)
         sh_r, vis_r = pt(POSE_SHOULDER_R)
@@ -350,7 +394,7 @@ class BodyAnchors:
         # Shoulders define the whole frame of reference; without them there is
         # nothing to anchor to.
         if min(vis_l, vis_r) < MIN_POSE_VISIBILITY:
-            return a
+            return a                      # a.aspect is already set
 
         origin = (sh_l + sh_r) / 2.0
         width = float(np.linalg.norm(sh_l - sh_r))
@@ -389,12 +433,24 @@ class BodyAnchors:
         delta = sh_l - sh_r
         a.tilt = float(np.arctan2(delta[1], delta[0]))
 
+        # Face expressions / Head orientation features
+        a.head_yaw = float((nose[0] - ear[0]) / width)
+        a.head_pitch = float((nose[1] - ear[1]) / width)
+        a.mouth_width = float(np.linalg.norm(mouth_l - mouth_r) / width)
+        a.mouth_pitch = float((mouth[1] - nose[1]) / width)
+
         return a
 
     # -- Use -----------------------------------------------------------------
 
     def to_body_coords(self, x: float, y: float) -> tuple[float, float]:
-        """Map a normalised frame point into body coordinates."""
+        """
+        Map an ISOTROPIC frame point into body coordinates.
+
+        `y` must already carry the aspect correction (y_raw * self.aspect).
+        Applying it here instead would double-correct the points built in
+        `from_pose`, which are already in isotropic units.
+        """
         if not self.valid:
             return float(x), float(y)
         return (float((x - self.origin[0]) / self.scale),
@@ -418,12 +474,16 @@ class BodyAnchors:
                 for name in ANCHOR_NAMES]
 
     def body_block(self) -> list[float]:
-        """The 4 per-frame body values appended after both hands."""
+        """The 8 per-frame body values appended after both hands."""
         return [
             float(self.scale),      # shoulder width in frame units -> distance cue
             float(self.face_size),  # head size relative to shoulders
             float(self.tilt),       # torso lean
             1.0 if self.valid else 0.0,
+            float(self.head_yaw),   # horizontal head orientation
+            float(self.head_pitch), # vertical head orientation
+            float(self.mouth_width),# smiling / mouth shape
+            float(self.mouth_pitch) # jaw drop / vertical mouth position
         ]
 
 
@@ -484,8 +544,14 @@ def extract_hand_features(hand_landmarks, anchors: "BodyAnchors" = None) -> list
     if hand_landmarks is None:
         return [0.0] * VALS_PER_HAND
 
+    # Same aspect correction as the pose landmarks, for the same reason: MediaPipe
+    # normalises y by the frame HEIGHT and x by its WIDTH. Left uncorrected, the
+    # hand's own shape is stretched vertically too, so finger directions and the
+    # palm normal come out of a squashed hand - which is a quieter error than the
+    # misplaced wrist, and the one that survives every position fix.
+    aspect = float(getattr(anchors, "aspect", 1.0) or 1.0)
     coords = np.array(
-        [[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark],
+        [[lm.x, lm.y * aspect, lm.z] for lm in hand_landmarks.landmark],
         dtype=np.float64,
     )
     block = hand_features_from_array(coords)      # 3 raw wrist + 60 shape
@@ -506,11 +572,219 @@ def extract_hand_features(hand_landmarks, anchors: "BodyAnchors" = None) -> list
     return block + distances
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  Cleaning a captured take — gaps and jitter
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Both of these run on the frames a gesture was captured from, BEFORE the
+# globals are measured and before the sequence is resampled. That ordering is
+# the whole point: the globals (speed, tempo, path) are measured on the raw
+# frames precisely because resampling destroys them — so anything that corrupts
+# the raw frames corrupts the globals, and it has to be cleaned first.
+#
+# They live here, and are called from exactly one place (GestureSegmenter), so
+# the recorder and the live server clean a take identically. Cleaning in only
+# one of the two would rebuild the train/inference mismatch this pipeline was
+# rewritten to remove.
+#
+# Both are off with TARJUMAN_CLEAN_TAKES=0, which is how any A/B of them is run.
+
+# How many consecutive frames a hand may be missing and still be filled in.
+# Measured on 391 recorded takes: 28% contained an interior dropout, and 74% of
+# those gaps were 3 frames or shorter. Beyond that it stops being a tracking
+# blink and starts being the hand genuinely leaving, which is not ours to
+# invent.
+MAX_HELD_FRAMES = int(_os.getenv("TARJUMAN_MAX_HELD_FRAMES", "3"))
+
+# A hand must actually be tracked before its gaps are worth repairing.
+#
+# Without this floor the repair does the opposite of its job. Measured on the
+# 391 recorded takes: filling every interior gap moved `hands_used` from
+# one-handed to two-handed in 42 of them — and in NONE of those 42 were both
+# hands present in even 40% of the frames. 33 had a hand below 15%: one take of
+# 'hello' had a left hand in a single frame out of thirty. That is a false
+# detection, and holding it across its neighbours was enough to make the take
+# read as two-handed.
+#
+# So a hand seen this rarely is left exactly as it is. The threshold matches
+# MIN_BONE_PRESENCE in export_signs_3d.py, which draws the same line for the
+# same reason.
+MIN_HAND_PRESENCE = float(_os.getenv("TARJUMAN_MIN_HAND_PRESENCE", "0.40"))
+
+# One Euro filter. `min_cutoff` sets how hard a motionless hand is smoothed,
+# `beta` how quickly smoothing relaxes as the hand speeds up — the property
+# that makes this filter worth using over a plain average: it removes tremor
+# while standing still without adding lag to a fast sign.
+ONE_EURO_MIN_CUTOFF = float(_os.getenv("TARJUMAN_EURO_MIN_CUTOFF", "1.2"))
+ONE_EURO_BETA = float(_os.getenv("TARJUMAN_EURO_BETA", "0.35"))
+CLEAN_TAKES = _os.getenv("TARJUMAN_CLEAN_TAKES", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+
+
+def _hand_present(frame, hand: int) -> bool:
+    """
+    Is hand `hand` (0 left, 1 right) in this frame?
+
+    An absent hand is 68 zeros — and that is not a defect to be repaired, it is
+    how "this sign uses one hand" is written down. `compute_global_features`
+    reads exactly this to decide `hands_used`, so every function below has to
+    leave a fully absent hand untouched.
+    """
+    base = hand * VALS_PER_HAND
+    return any(frame[base:base + VALS_PER_HAND])
+
+
+def fill_tracking_gaps(frames, max_gap: int = None) -> list:
+    """
+    Carry the last good reading across a brief loss of tracking.
+
+    MediaPipe drops a hand for a frame or two all the time — a finger crosses
+    the palm, the hand turns edge-on, the light flickers. The pipeline wrote 68
+    zeros for each of those frames, which is not a small error: the hand does
+    not move to the origin and back, so every measure taken from the raw frames
+    sees a violent excursion that never happened. It is the single largest
+    source of the speed spikes that forced `take_quality.analyse()` to use a
+    90th percentile instead of the actual maximum.
+
+    Only INTERIOR gaps are filled, and only for a hand that is genuinely being
+    tracked (`MIN_HAND_PRESENCE`) — a stretch with a real reading on both sides
+    of it, belonging to a hand that is really there. Leading and trailing absences are left alone, because there is no
+    reading to carry and nothing to prove the hand was ever there. A hand absent
+    for the whole take therefore stays 68 zeros in every frame, and one-handed
+    signs are encoded exactly as before.
+    """
+    if max_gap is None:
+        max_gap = MAX_HELD_FRAMES
+    out = [list(f) for f in frames]
+    n = len(out)
+    if n < 3 or max_gap <= 0:
+        return out
+
+    for hand in (0, 1):
+        base = hand * VALS_PER_HAND
+        end = base + VALS_PER_HAND
+        seen = [_hand_present(f, hand) for f in out]
+        if not any(seen):
+            continue                       # never there: leave it that way
+
+        # Barely there is not there. Repairing around a handful of frames turns
+        # a false detection into a confident one — see MIN_HAND_PRESENCE.
+        if (sum(seen) / n) < MIN_HAND_PRESENCE:
+            continue
+
+        first, last = seen.index(True), n - 1 - seen[::-1].index(True)
+        i = first
+        while i <= last:
+            if seen[i]:
+                i += 1
+                continue
+            j = i
+            while j <= last and not seen[j]:
+                j += 1
+            # j <= last is guaranteed by construction, so both sides are real
+            if (j - i) <= max_gap:
+                carried = out[i - 1][base:end]
+                for k in range(i, j):
+                    out[k][base:end] = list(carried)
+            i = j
+    return out
+
+
+class _OneEuro:
+    """
+    One Euro filter over a vector, with dt supplied per sample.
+
+    Chosen over a fixed low-pass because its cutoff follows the speed of the
+    signal: nearly still -> smooth hard, so tremor disappears; moving fast ->
+    barely smooth, so a quick sign is not delayed or rounded off. A fixed
+    filter has to pick one of those and lose the other.
+    """
+
+    __slots__ = ("min_cutoff", "beta", "d_cutoff", "_x", "_dx")
+
+    def __init__(self, min_cutoff: float, beta: float, d_cutoff: float = 1.0):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self._x = None
+        self._dx = None
+
+    @staticmethod
+    def _alpha(cutoff, dt):
+        tau = 1.0 / (2.0 * np.pi * max(cutoff, 1e-6))
+        return 1.0 / (1.0 + tau / max(dt, 1e-6))
+
+    def reset(self) -> None:
+        self._x = None
+        self._dx = None
+
+    def __call__(self, x: np.ndarray, dt: float) -> np.ndarray:
+        if self._x is None:
+            self._x = np.asarray(x, dtype=np.float64)
+            self._dx = np.zeros_like(self._x)
+            return self._x
+        dx = (x - self._x) / max(dt, 1e-6)
+        a_d = self._alpha(self.d_cutoff, dt)
+        self._dx = a_d * dx + (1.0 - a_d) * self._dx
+        cutoff = self.min_cutoff + self.beta * np.abs(self._dx)
+        a = 1.0 / (1.0 + (1.0 / (2.0 * np.pi * np.maximum(cutoff, 1e-6))) / max(dt, 1e-6))
+        self._x = a * x + (1.0 - a) * self._x
+        return self._x
+
+
+def smooth_tracking_jitter(frames, fps: float = None) -> list:
+    """
+    Take the tremor out of the landmarks without blunting the sign.
+
+    Measured on 391 takes: the fastest single step in a take is a median 1.4x
+    the 90th-percentile step, but reaches 19.7x — a hand appearing to move
+    twenty times its own top speed between two frames. Nothing physical does
+    that; it is the tracker guessing. Left in, it inflates `peak_speed` and
+    `path_length`, which the model reads as if they were the sign's own tempo.
+
+    Each hand is filtered on its own and only across frames where it is
+    actually present. The filter is reset whenever a hand disappears, so a
+    reading from before a gap is never blended into one after it.
+    """
+    out = [list(f) for f in frames]
+    n = len(out)
+    if n < 3:
+        return out
+
+    dt = 1.0 / float(fps) if fps and fps > 0 else 1.0 / GLOBALS_REFERENCE_FPS
+
+    for hand in (0, 1):
+        base = hand * VALS_PER_HAND
+        end = base + VALS_PER_HAND
+        euro = _OneEuro(ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA)
+        for i in range(n):
+            if not _hand_present(out[i], hand):
+                euro.reset()               # do not bridge across an absence
+                continue
+            block = np.asarray(out[i][base:end], dtype=np.float64)
+            out[i][base:end] = euro(block, dt).tolist()
+    return out
+
+
+def clean_take(frames, fps: float = None) -> list:
+    """
+    Gaps first, then jitter — the order matters.
+
+    Filling a gap after smoothing would feed the filter a zero-excursion it
+    then spreads over the neighbouring frames, so the spike survives as a
+    smeared version of itself. Filling first means the filter only ever sees
+    plausible readings.
+    """
+    if not CLEAN_TAKES:
+        return [list(f) for f in frames]
+    return smooth_tracking_jitter(fill_tracking_gaps(frames), fps)
+
+
 def extract_frame_features(results, anchors: "BodyAnchors" = None) -> list[float]:
     """
     Build the full VALS_PER_FRAME vector for one frame.
 
-    Layout: [left hand 68] + [right hand 68] + [body 4].
+    Layout: [left hand 68] + [right hand 68] + [body 8].
 
     `anchors` may be None (or invalid) — the hands are then expressed in frame
     coordinates and the body flag is 0, so the model can tell the difference
@@ -635,8 +909,28 @@ def compute_global_features(frames, duration_seconds: float) -> list[float]:
     mean_open = float(np.mean(openness)) if openness else 0.0
     open_change = float(np.max(openness) - np.min(openness)) if len(openness) > 1 else 0.0
 
-    max_hands = max(hands_present) if hands_present else 0
-    hands_used = 0.0 if max_hands == 0 else (0.5 if max_hands == 1 else 1.0)
+    # -- How many hands this sign uses ---------------------------------------
+    # This was `max(hands_present)` — the largest count seen in ANY SINGLE
+    # frame — which let one frame decide a feature for the whole take. One
+    # spurious detection of a second hand, and a one-handed sign was recorded
+    # as two-handed.
+    #
+    # It was not a rare edge: of the 391 takes in the previous dataset, 47 were
+    # labelled two-handed and 23 of those — 49% — had a second hand present in
+    # under 15% of their frames. One take of 'name' was called two-handed on
+    # the strength of a left hand appearing in a single frame out of thirty.
+    #
+    # A hand now counts when it is actually tracked through the sign rather
+    # than glimpsed once. Same threshold as the gap repair above, for the same
+    # reason: below it, a detection is noise.
+    n_frames = len(arr)
+    active = 0
+    for h in range(2):
+        seen = sum(1 for row in arr
+                   if np.any(row[h * VALS_PER_HAND:(h + 1) * VALS_PER_HAND]))
+        if n_frames and (seen / n_frames) >= MIN_HAND_PRESENCE:
+            active += 1
+    hands_used = 0.0 if active == 0 else (0.5 if active == 1 else 1.0)
 
     return [
         duration,

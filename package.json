@@ -13,20 +13,32 @@
     "dev:browser": "concurrently --handle-input --default-input-target 0 --names \"backend,web\" --prefix-colors \"cyan,green\" --kill-others-on-fail \"npm:dev:server\" \"npm:dev:web\"",
     "build": "npm --prefix tarjuman run tauri build",
     "collect": "node scripts/run-python.mjs data_collector.py",
+    "videos": "node scripts/run-python.mjs scripts/video_to_csv.py",
+    "vids": "node scripts/run-python.mjs record_videos.py",
     "train": "node scripts/run-python.mjs train_model.py",
+    "trainstill": "node scripts/trainstill.mjs",
     "test": "node scripts/run-python.mjs test_model.py",
     "migrate": "node scripts/run-python.mjs scripts/migrate_dataset.py",
     "cameras": "node scripts/run-python.mjs scripts/list_cameras.py",
     "sheet": "node scripts/run-python.mjs scripts/make_learn_sheet.py",
     "check": "node scripts/run-python.mjs src/tarjuman_core/vocabulary.py",
     "export3d": "node scripts/run-python.mjs export_signs_3d.py",
+    "measurerig": "node scripts/run-python.mjs scripts/measure_rig.py",
     "mirror": "node scripts/run-python.mjs mirror_test.py",
     "doctor": "node scripts/run-python.mjs scripts/diagnose.py",
+    "audit": "node scripts/run-python.mjs scripts/audit_signs.py",
     "fix": "node scripts/run-python.mjs scripts/fix_env.py",
-    "bench": "node scripts/run-python.mjs scripts/bench_pipeline.py"
+    "bench": "node scripts/run-python.mjs scripts/bench_pipeline.py",
+    "bench:face": "node scripts/run-python.mjs scripts/bench_face.py",
+    "provenance": "node scripts/run-python.mjs scripts/add_provenance.py",
+    "loso": "node scripts/run-python.mjs scripts/evaluate_signers.py",
+    "compress:avatar": "node scripts/compress_avatar.mjs",
+    "audit:avatar": "node scripts/audit_avatar.mjs"
   },
   "devDependencies": {
+    "@gltf-transform/cli": "^4.5.0",
     "concurrently": "^10.0.0",
+    "sharp": "^0.35.4",
     "wait-on": "^9.0.10"
   },
   "workspaces": [

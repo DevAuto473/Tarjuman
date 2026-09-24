@@ -66,7 +66,7 @@ import websockets
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
-from tarjuman_core.paths import data, root
+from tarjuman_core.paths import data, dataset_csv, root
 from tarjuman_core.camera_manager import (
     SmartCamera, choose_camera_interactive, describe_cameras, droidcam_url,
 )
@@ -372,7 +372,7 @@ except Exception as exc:
 # Built from the same CSV the classifier trains on, so practice mode works
 # without recording a separate reference set. Adding a new word to the
 # dictionary needs only one new recording — no retraining.
-REFERENCE_CSV = data("dynamic_gestures_v4.csv")
+REFERENCE_CSV = dataset_csv()
 dtw_library = SignReferenceLibrary.from_csv(REFERENCE_CSV)
 
 
@@ -750,9 +750,15 @@ def process_frame_sync(frame: np.ndarray,
             if now_t >= session.mirror_next_at:
                 session.mirror_next_at = now_t + (1.0 / MIRROR_FPS)
                 try:
+                    # Live, the signer's landmarks are measured directly - no
+                    # need to recover them from distances as the exporter does.
+                    # Handing them over is what lets a hand at YOUR chin arrive
+                    # at the avatar's, whose proportions are not yours.
                     result_payload["messages"].append({
                         "type": "live_pose",
-                        "pose": frame_to_bone_dirs(frame_features),
+                        "pose": frame_to_bone_dirs(
+                            frame_features,
+                            anchors=(anchors.points if anchors.valid else None)),
                         "body": bool(anchors.valid),
                     })
                 except Exception as exc:

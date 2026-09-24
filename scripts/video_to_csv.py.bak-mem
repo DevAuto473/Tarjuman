@@ -1,0 +1,637 @@
+"""
+video_to_csv.py — From recorded videos to dataset rows
+=============================================================
+    npm run videos            # All in recorded_videos/
+    npm run videos -- --dry-run
+
+Expected structure:
+
+    recorded_videos/
+        hello/  vid1.mp4  vid2.mp4 …
+        deaf/   …
+
+Why not real-time?
+------------------------
+Live capture is bound by frame rate: `model_complexity=0` for hands, and body
+once every five frames. With motion blur and low light, a hand drops from tracking,
+so the dataset gets zeros mid-gesture.
+
+Here there is no time limit. Three things change:
+
+  • `model_complexity=1` for hands and 1 for body — more accurate tracking.
+  • Body in **every** frame, not once every five — more accurate anchors, which are 5 values
+    out of 68 for each hand.
+  • A second pass over the whole video: filling gaps, and fixing left/right swaps.
+    This alone is impossible live: you don't know the future while capturing.
+
+Guiding principle: Do not rewrite extraction
+------------------------------------
+Features are built using the exact same `feature_extractor` functions as the live path —
+`extract_hand_features` then `compute_global_features` then `resample_sequence`.
+A second copy of the math would drift, training the model in one space and inferring in
+another — a silent failure that doesn't show in logs.
+
+Layout: 144 values per frame
+------------------------
+    68 per hand = 3 (wrist) + 60 (20 normalized relative landmarks) + 5 (anchors)
+    144 = 68×2 + 8 (body mass)
+    Row = label + metadata + 30×144 + 12 globals
+"""
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "src"))
+
+import argparse
+import csv
+import datetime as _dt
+import json
+import multiprocessing as mp_proc
+import time as _time
+import os
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+import mediapipe as mp
+
+from tarjuman_core import take_quality
+from tarjuman_core.feature_extractor import (
+    BodyAnchors, MIRROR_FRAME, SEQUENCE_LENGTH, TOTAL_FEATURES, VALS_PER_FRAME,
+    compute_global_features, extract_hand_features, prepare_frame, split_hands,
+)
+from tarjuman_core.gesture_segmenter import resample_sequence
+from tarjuman_core.paths import data, root
+from tarjuman_core.provenance import (
+    LABEL_COLUMN, PROVENANCE_COLUMNS,
+    feature_column_names, new_session_id, slugify,
+)
+
+VIDEO_SUFFIXES = (".mp4", ".mov", ".avi", ".mkv", ".webm")
+
+# A sixth column above the existing description columns. Readers (dataset.py and train_model.py)
+# find the start of features by the name `f0_v0`, so adding a column before it breaks nothing.
+SOURCE_COLUMN = "source"
+SOURCE_VIDEO = "video"
+
+# The longest gap to fill, in seconds. Anything longer is inventing motion, not estimating it.
+MAX_GAP_SECONDS = 0.25
+
+# `take_quality.analyse` is written for live capture, and some of what it reports is guidance
+# for the user, not a data defect. These two specifically fall outside the `segmented` block
+# in the source, so they fire even on a trimmed recording:
+#
+#     "No hand detected at the start of the take."
+#     "No hand detected at the end of the take."
+#
+# Live they have meaning: the segmenter opens the window with motion, so the hand must be there.
+# For a video, the first frames are raising the hand to the frame and the last are lowering it —
+# which is what every signer does. Counting it as a defect rejects good takes: a take with
+# 93% detection might be rejected while its sister at 97% is accepted, and the difference is one frame.
+#
+# They remain visible in the report as a note, and do not drop the take.
+LIVE_ONLY_PROBLEMS = (
+    "No hand detected at the start",
+    "No hand detected at the end",
+)
+
+# Below this ratio, the hand is not considered part of the sign, so measuring its gaps is meaningless:
+# A fleeting detection in 5% of frames produces a "gap" the length of the whole video. The threshold
+# is the same one `take_quality` uses to consider a sign two-handed.
+HAND_IN_USE = 0.40
+
+# How many frames between one Pose call and the next.
+#
+# This used to run on EVERY frame, which doubled the run time for nothing. The
+# anchors it provides (shoulders, nose, ear, mouth) belong to a seated signer's
+# torso, which barely moves: the `PoseTracker` comment on the live path says
+# 1-in-5 is indistinguishable, and measured 24 ms per call there.
+#
+# Three here rather than five: off the real-time clock we can afford half again
+# as often, and head yaw and mouth motion — both part of the 8-value body block
+# — change faster than the shoulders do. Between calls the last valid anchor is
+# carried forward, exactly as `PoseTracker` does.
+POSE_EVERY_N = 3
+
+# -- Temporal smoothing (Savitzky-Golay) --------------------------------------
+# Landmarks jitter frame to frame even when the hand is still: the detector
+# re-estimates every frame and lands a pixel or two away each time. That jitter
+# is not motion, but `mean_speed`, `peak_speed` and `path_length` - three of the
+# twelve globals - are all read from frame-to-frame steps, so it is counted as
+# motion and inflates them.
+#
+# Savitzky-Golay rather than a moving average or One Euro:
+#   - It fits a low-order polynomial over a sliding window instead of averaging,
+#     so it removes noise WITHOUT flattening peaks. A moving average would blunt
+#     exactly the sharp direction changes that distinguish one sign from another.
+#   - It is symmetric: it reads frames before AND after. That means zero phase
+#     lag - the smoothed path sits on the original, not behind it. One Euro is
+#     causal (past only) and therefore lags, which is the right trade-off live
+#     and the wrong one offline, where the whole video is already on disk.
+#
+# The window is deliberately short. At 30 fps, 7 frames is 0.23 s - long enough
+# to average out detector noise, short enough to leave a hold in the sign intact.
+# A hold is meaning, not a pause.
+SMOOTH_WINDOW = 7        # frames, must be odd; 0 disables smoothing
+SMOOTH_POLYORDER = 2
+
+# Only linear interpolation is accepted. Cubic overshoots values at the edges, inventing
+# acceleration that didn't happen — and `peak_speed` from the globals is read from these exact data.
+
+
+# -----------------------------------------------------------------------------
+#  A thin shell resembling MediaPipe landmarks
+# -----------------------------------------------------------------------------
+# After interpolation, landmarks become a numpy array, while `extract_hand_features`
+# expects an object with `.landmark[i].x/.y/.z`. The shell connects the two without modifying
+# the shared function with the live path.
+
+class _Point:
+    __slots__ = ("x", "y", "z")
+
+    def __init__(self, x, y, z):
+        self.x, self.y, self.z = float(x), float(y), float(z)
+
+
+class _Hand:
+    __slots__ = ("landmark",)
+
+    def __init__(self, arr):
+        self.landmark = [_Point(*p) for p in arr]
+
+
+def _to_array(landmarks):
+    if landmarks is None:
+        return None
+    return np.array([[p.x, p.y, p.z] for p in landmarks.landmark],
+                    dtype=np.float32)
+
+
+# -----------------------------------------------------------------------------
+#  Reading and Detection
+# -----------------------------------------------------------------------------
+
+def load_labels_map(path):
+    """
+    Reads a mapping file {folder_name: word_id}.
+
+    Why it's needed: folder names might be localized (`ahln`) while `vocabulary.py`
+    IDs are English (`hello`). Without mapping, the same word enters as two different
+    labels, and the classifier learns they are two things.
+
+    Keys starting with an underscore are comments and ignored.
+    """
+    if not path:
+        return {}
+    p = Path(path)
+    if not p.is_file():
+        print(f"[FAIL] Mapping file not found: {p}")
+        raise SystemExit(1)
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    return {k: v for k, v in raw.items() if not k.startswith("_")}
+
+
+def read_video(path: Path):
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        return [], 0.0
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    frames = []
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frames.append(frame)
+    cap.release()
+    # Unknown or absurd rate: estimate at 30 so duration doesn't corrupt globals.
+    if not (1.0 < fps < 240.0):
+        fps = 30.0
+    return frames, float(fps)
+
+
+def detect(frames, hands, pose, mirror: bool, pose_every: int = POSE_EVERY_N):
+    """Detect every frame; return raw landmarks and body anchors."""
+    left, right, anchors = [], [], []
+    last_anchor = BodyAnchors()
+    for i, frame in enumerate(frames):
+        rgb = cv2.cvtColor(prepare_frame(frame) if mirror else frame,
+                           cv2.COLOR_BGR2RGB)
+        rgb.flags.writeable = False
+        left_r = hands.process(rgb)
+
+        # Pose is throttled, and the last valid anchor is carried between
+        # calls — exactly what `PoseTracker` does live, so the two coordinate
+        # spaces stay identical.
+        if i % max(1, pose_every) == 0:
+            a = BodyAnchors.from_pose(pose.process(rgb))
+            if getattr(a, "valid", False):
+                last_anchor = a
+        anchors.append(last_anchor)
+
+        l, r = split_hands(left_r)
+        left.append(_to_array(l))
+        right.append(_to_array(r))
+    return left, right, anchors
+
+
+def stabilise_sides(left, right):
+    """
+    Prevents left and right from flipping mid-video.
+
+    MediaPipe tags are calculated per-frame so they sometimes flip, causing the two
+    68-blocks to swap positions and turning the trajectory into nonsense. Correction
+    is by proximity: whichever assignment keeps the wrists closer to their previous position.
+
+    Only corrected when both hands are detected and their previous positions are known —
+    in a one-handed sign there is no comparison anyway, and guessing a ratio there harms.
+    """
+    swaps = 0
+    prev_l = prev_r = None
+    for i in range(len(left)):
+        l, r = left[i], right[i]
+        if l is not None and r is not None and prev_l is not None and prev_r is not None:
+            keep = (np.linalg.norm(l[0] - prev_l) + np.linalg.norm(r[0] - prev_r))
+            swap = (np.linalg.norm(l[0] - prev_r) + np.linalg.norm(r[0] - prev_l))
+            # Conservative threshold: only swap when it's clearly better.
+            if swap < keep * 0.6:
+                left[i], right[i] = r, l
+                l, r = r, l
+                swaps += 1
+        if l is not None:
+            prev_l = l[0]
+        if r is not None:
+            prev_r = r[0]
+    return swaps
+
+
+def fill_gaps(seq, max_gap: int):
+    """
+    Fills **internal** gaps only, using linear interpolation on raw landmarks.
+
+    Three deliberate constraints:
+      • Internal only — a hand missing at the start or end of the video is not a defect to fill,
+        but what happened. And in a one-handed sign, the other is absent the whole time, and that
+        is information (`hands_used`), not a gap.
+      • A cap on length — anything exceeding `max_gap` is left and reported.
+      • On raw landmarks before extraction — the vector contains derived quantities (normalized shape,
+        anchor distances, detection flag), and interpolating them produces a geometrically impossible
+        hand and a detection flag of 0.6.
+
+    Returns (number of frames filled, longest gap rejected).
+    """
+    present = [s is not None for s in seq]
+    n = len(seq)
+    filled, worst = 0, 0
+    i = 0
+    while i < n:
+        if present[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and not present[j]:
+            j += 1
+        # i..j-1 is a gap. It's only internal if it has two detected ends.
+        if i > 0 and j < n:
+            length = j - i
+            if length <= max_gap:
+                a, b = seq[i - 1], seq[j]
+                for k in range(i, j):
+                    t = (k - i + 1) / (length + 1)
+                    seq[k] = a * (1.0 - t) + b * t
+                filled += length
+            else:
+                worst = max(worst, length)
+        i = j
+    return filled, worst
+
+
+# -----------------------------------------------------------------------------
+#  Writing
+# -----------------------------------------------------------------------------
+
+def header_row():
+    return [LABEL_COLUMN, *PROVENANCE_COLUMNS, SOURCE_COLUMN,
+            *feature_column_names()]
+
+
+def ensure_header(path: Path):
+    if path.exists() and path.stat().st_size > 0:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(header_row())
+    print(f"   Created {path.name} ({len(header_row())} columns)")
+
+
+def append_row(path: Path, label, meta, sequence, globals_):
+    frames = np.asarray(sequence, dtype=np.float32)
+    assert frames.shape == (SEQUENCE_LENGTH, VALS_PER_FRAME), frames.shape
+    row = [label, *meta] + frames.reshape(-1).tolist() + list(globals_)
+    assert len(row) == 1 + len(PROVENANCE_COLUMNS) + 1 + TOTAL_FEATURES, len(row)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(row)
+
+
+# -----------------------------------------------------------------------------
+
+def smooth_track(seq, window: int = SMOOTH_WINDOW,
+                 polyorder: int = SMOOTH_POLYORDER) -> int:
+    """
+    Smooth one hand's landmark track in place. Returns the frames touched.
+
+    Applied per CONTIGUOUS RUN of present frames, never across a gap that
+    `fill_gaps` refused to fill. Smoothing across a real absence would blend the
+    last position before the hand vanished into the first one after it came
+    back - inventing a straight glide through frames where nothing was seen.
+
+    Runs shorter than the window are left alone rather than smoothed with a
+    shrunken window: a 3-frame run carries no noise worth removing, and fitting
+    a polynomial to it mostly fits the noise.
+    """
+    if window < 3 or window % 2 == 0:
+        return 0
+    from scipy.signal import savgol_filter
+
+    n = len(seq)
+    touched = 0
+    i = 0
+    while i < n:
+        if seq[i] is None:
+            i += 1
+            continue
+        j = i
+        while j < n and seq[j] is not None:
+            j += 1
+        run = j - i
+        if run >= window:
+            block = np.stack(seq[i:j])                     # (run, 21, 3)
+            flat = block.reshape(run, -1)
+            # mode="interp" fits a polynomial at the edges instead of padding,
+            # so the first and last frames keep their real values. The start and
+            # end of a sign carry meaning; flattening them would cost it.
+            out = savgol_filter(flat, window, polyorder, axis=0, mode="interp")
+            out = out.reshape(block.shape).astype(np.float32)
+            for k in range(run):
+                seq[i + k] = out[k]
+            touched += run
+        i = j
+    return touched
+
+
+# -----------------------------------------------------------------------------
+#  Parallelism
+# -----------------------------------------------------------------------------
+# Videos are fully independent and the machine has several cores. But MediaPipe
+# graph objects are not thread-safe (the `PoseTracker` docstring says so itself),
+# so this parallelises across PROCESSES, not threads: each process builds its own
+# pair of models once, when it starts.
+#
+# The models are built in the initializer rather than passed in, because they are
+# not picklable to begin with.
+
+_W = {}
+
+
+def _init_worker(args):
+    import mediapipe as mp_
+    _W["args"] = args
+    _W["hands"] = mp_.solutions.hands.Hands(
+        static_image_mode=False, max_num_hands=2,
+        model_complexity=args.hands_complexity,
+        min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    _W["pose"] = mp_.solutions.pose.Pose(
+        static_image_mode=False, model_complexity=args.pose_complexity,
+        smooth_landmarks=True,
+        min_detection_confidence=0.5, min_tracking_confidence=0.5)
+
+
+def _run_one(job):
+    label, path = job
+    return process(Path(path), label, _W["hands"], _W["pose"], _W["args"])
+
+
+def process(path: Path, label: str, hands, pose, args):
+    """Processes a single video. Returns (row or None, report)."""
+    rep = {"file": path.name, "label": label}
+    frames, fps = read_video(path)
+    rep["frames"], rep["fps"] = len(frames), fps
+    if len(frames) < 5:
+        rep["verdict"] = "Rejected: too few frames"
+        return None, rep
+
+    duration = len(frames) / fps
+    rep["seconds"] = round(duration, 2)
+
+    left, right, anchors = detect(frames, hands, pose, mirror=not args.no_mirror,
+                                  pose_every=args.pose_every)
+    rep["swaps"] = stabilise_sides(left, right)
+
+    max_gap = max(1, int(round(args.max_gap * fps)))
+    # Ratios are measured before interpolation: after it, every hand is filled so it indicates nothing.
+    rep["seen"] = {
+        "left": sum(s is not None for s in left) / len(frames),
+        "right": sum(s is not None for s in right) / len(frames),
+    }
+    fl, wl = fill_gaps(left, max_gap)
+    fr, wr = fill_gaps(right, max_gap)
+    rep["filled"] = fl + fr
+    rep["gaps"] = {"left": wl, "right": wr}
+    rep["worst_gap"] = max(wl, wr)
+
+    # Smoothing comes AFTER gap filling, so an interpolated stretch is smoothed
+    # into its neighbours instead of meeting them at a corner. And it runs on the
+    # raw landmarks, before extraction, for the same reason interpolation does:
+    # the 144-value vector holds derived quantities, and smoothing those directly
+    # would produce a hand shape no hand can make.
+    rep["smoothed"] = (smooth_track(left, args.smooth_window)
+                       + smooth_track(right, args.smooth_window))
+
+    seq = [extract_hand_features(_Hand(l) if l is not None else None, a)
+           + extract_hand_features(_Hand(r) if r is not None else None, a)
+           + a.body_block()
+           for l, r, a in zip(left, right, anchors)]
+
+    # Globals are calculated before resampling — resampling is what erases the duration.
+    globals_ = compute_global_features(seq, duration)
+    quality = take_quality.analyse(seq, duration, segmented=True)
+
+    # Defect that drops the take, or a note to mention?
+    problems, notes = [], []
+    for p in quality.get("problems", []):
+        (notes if p.startswith(LIVE_ONLY_PROBLEMS) else problems).append(p)
+
+    # Gap is calculated for the active hand only. The other might naturally be absent.
+    for side in ("left", "right"):
+        if rep["seen"][side] >= HAND_IN_USE and rep["gaps"][side] > 0:
+            problems.append(
+                f"Gap of {rep['gaps'][side]} frames in the "
+                f"{'left' if side == 'left' else 'right'} hand "
+                f"was not filled (cap is {max_gap})")
+        elif rep["gaps"][side] > 0:
+            notes.append(f"Gap in inactive hand ({side}) - ignored")
+
+    rep["problems"], rep["notes"] = problems, notes
+
+    if problems and not args.keep_bad:
+        rep["verdict"] = "Rejected"
+        return None, rep
+
+    rep["verdict"] = "Accepted" + (" (with reservations)" if problems else "")
+    return (resample_sequence(seq, SEQUENCE_LENGTH), globals_), rep
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Recorded videos -> Dataset")
+    ap.add_argument("--videos", default=root("recorded_videos"))
+    ap.add_argument("--out", default=str(data("dynamic_gestures_v6.csv")))
+    ap.add_argument("--signer", default="unknown")
+    ap.add_argument("--camera", default="video-file")
+    ap.add_argument("--max-gap", type=float, default=MAX_GAP_SECONDS,
+                    help="Longest gap to fill, in seconds")
+    ap.add_argument("--hands-complexity", type=int, default=1, choices=(0, 1))
+    ap.add_argument("--pose-complexity", type=int, default=1, choices=(0, 1, 2))
+    ap.add_argument("--no-mirror", action="store_true",
+                    help="Do not mirror the frame. Use if the video is already mirrored "
+                         "(front camera recording showing a mirrored preview).")
+    ap.add_argument("--jobs", type=int, default=0,
+                    help="how many videos to process at once (0 = CPU count minus one)")
+    ap.add_argument("--pose-every", type=int, default=POSE_EVERY_N,
+                    help="run the body model once every N frames")
+    ap.add_argument("--smooth-window", type=int, default=SMOOTH_WINDOW,
+                    help="Savitzky-Golay window in frames, odd; 0 disables it")
+    ap.add_argument("--labels-map", default=None,
+                    help="JSON file mapping folder name to word ID")
+    ap.add_argument("--strict-labels", action="store_true",
+                    help="Skip any folder not in the mapping file")
+    ap.add_argument("--keep-bad", action="store_true",
+                    help="Accept takes with reservations instead of rejecting them")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    vroot = Path(args.videos)
+    if not vroot.is_dir():
+        print(f"[FAIL] Folder not found: {vroot}")
+        return 1
+
+    lmap = load_labels_map(args.labels_map)
+    jobs, unmapped, skipped = [], set(), set()
+    for sub in sorted(p for p in vroot.iterdir() if p.is_dir()):
+        vids = [v for v in sorted(sub.iterdir())
+                if v.suffix.lower() in VIDEO_SUFFIXES]
+        if not vids:
+            continue
+        if sub.name in lmap:
+            label = lmap[sub.name]
+        elif lmap and args.strict_labels:
+            skipped.add(sub.name)
+            continue
+        else:
+            if lmap:
+                unmapped.add(sub.name)
+            label = slugify(sub.name, sub.name)
+        jobs.extend((label, v) for v in vids)
+    if not jobs:
+        print(f"[FAIL] No videos under {vroot}")
+        print("       Expected structure: recorded_videos/<word>/*.mp4")
+        return 1
+
+    print("=" * 70)
+    print(f"   {len(jobs)} videos  |  hands c={args.hands_complexity}  "
+          f"body c={args.pose_complexity} per frame")
+    print(f"   Output: {args.out}")
+    if args.no_mirror:
+        print("   No mirror (--no-mirror)")
+    elif MIRROR_FRAME:
+        print("   Frame is mirrored like in the live path")
+    if unmapped:
+        print(f"   [!] {len(unmapped)} folders not in mapping file, will use their own names:")
+        print(f"       {', '.join(sorted(unmapped))}")
+    if skipped:
+        print(f"   [!] Skipped {len(skipped)} folders (--strict-labels): "
+              f"{', '.join(sorted(skipped))}")
+    print("=" * 70)
+
+    out = Path(args.out)
+    if not args.dry_run:
+        ensure_header(out)
+    session = new_session_id()
+    stamp = _dt.datetime.now().isoformat(timespec="seconds")
+
+    n_jobs = args.jobs if args.jobs > 0 else max(1, (os.cpu_count() or 2) - 1)
+    n_jobs = min(n_jobs, len(jobs))
+    print(f"   {n_jobs} parallel worker(s)  |  body once every {args.pose_every} frame(s)")
+
+    started = _time.time()
+    if n_jobs > 1:
+        ctx = mp_proc.get_context("spawn")   # Windows has no fork
+        pool = ctx.Pool(n_jobs, initializer=_init_worker, initargs=(args,))
+        stream = pool.imap(_run_one, [(l, str(v)) for l, v in jobs])
+    else:
+        _init_worker(args)
+        pool = None
+        stream = (_run_one((l, str(v))) for l, v in jobs)
+
+    written, rejected = 0, []
+    for done, (res, rep) in enumerate(stream, 1):
+        label, vid = jobs[done - 1][0], jobs[done - 1][1]
+        elapsed = _time.time() - started
+        eta = elapsed / done * (len(jobs) - done)
+        print(f"\n   [{done}/{len(jobs)}]  ~{eta/60:.0f} min left", end="")
+        seen = rep.get("seen", {"left": 0, "right": 0})
+        print(f"\n   {label:<14s} {rep['file']}")
+        print(f"      {rep['frames']:4d} frames @ {rep['fps']:.0f}  "
+              f"({rep.get('seconds', 0):.2f} s)   "
+              f"left {seen['left']*100:3.0f}%  right {seen['right']*100:3.0f}%")
+        if rep.get("smoothed"):
+            print(f"      Smoothed {rep['smoothed']} frames "
+                  f"(Savitzky-Golay, window {args.smooth_window})")
+        if rep.get("filled"):
+            print(f"      Filled {rep['filled']} frames with interpolation")
+        if rep.get("swaps"):
+            print(f"      Corrected {rep['swaps']} hand-ratio swaps")
+        for n in rep.get("notes", []):
+            print(f"      ·   {n}")
+        for p in rep.get("problems", []):
+            print(f"      [!] {p}")
+        print(f"      -> {rep['verdict']}")
+
+        if res is None:
+            rejected.append(rep)
+            continue
+        if args.dry_run:
+            written += 1
+            continue
+        sequence, globals_ = res
+        append_row(out, label,
+                   (args.signer, args.camera, session, stamp, SOURCE_VIDEO),
+                   sequence, globals_)
+        written += 1
+
+    if pool is not None:
+        pool.close(); pool.join()
+    print(f"\n   Took {(_time.time() - started) / 60:.1f} min")
+
+    print("\n" + "=" * 70)
+    print(f"   {written} accepted  |  {len(rejected)} rejected")
+    if rejected:
+        print("\n   Rejected — re-record these:")
+        for r in rejected:
+            print(f"      {r['label']:<14s} {r['file']:<28s} {r['verdict']}")
+            for p in r.get("problems", [])[:2]:
+                print(f"         - {p}")
+    if args.dry_run:
+        print("\n   (Dry run — nothing written)")
+    else:
+        print(f"\n   Output: {out}")
+        print("   To train on it:  TARJUMAN_CSV=%s npm run train" % out)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        _sys.exit(main())
+    except KeyboardInterrupt:
+        print("\n   Stopped.")
+        _sys.exit(130)

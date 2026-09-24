@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "tarjuman-web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "tarjuman", "run", "dev"],
+      "port": 5173
+    }
+  ]
+}

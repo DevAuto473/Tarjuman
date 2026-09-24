@@ -48,7 +48,7 @@ from sklearn.model_selection import (
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
-from tarjuman_core.paths import data, root
+from tarjuman_core.paths import data, dataset_csv, root
 from tarjuman_core.onnx_export import export_pipeline
 
 
@@ -58,7 +58,7 @@ from tarjuman_core.onnx_export import export_pipeline
 #  Configuration
 # -----------------------------------------------------------------------------
 
-INPUT_CSV       = os.environ.get("TARJUMAN_CSV", data("dynamic_gestures_v4.csv"))
+INPUT_CSV       = os.environ.get("TARJUMAN_CSV", dataset_csv())
 PKL_MODEL_PATH  = root("sign_model.pkl")     # dev / inspection only
 ONNX_MODEL_PATH = root("sign_model.onnx")    # production artifact used by the server
 LABELS_JSON     = data("labels.json")
@@ -69,6 +69,25 @@ CM_IMAGE        = root("confusion_matrix.png")
 # Set TARJUMAN_SKIP_CV=1 to skip it once the vocabulary is large enough that
 # five extra trainings start to hurt.
 CV_FOLDS = 5
+
+# A stratified train/test split needs every class on both sides of the line, and
+# 5-fold cross-validation needs five. Below five samples a word cannot be
+# measured, only memorised. The pre-flight refuses to train rather than report a
+# number that means nothing.
+MIN_PER_CLASS = 5
+
+# TARJUMAN_DROP_RARE=1 trains on the words that DO have enough samples and sets
+# the rest aside, instead of refusing outright. The dropped words are named, and
+# they are absent from labels.json - so the model never answers them at all.
+# This is for getting a usable model out of a partly recorded vocabulary; the
+# fix is still to record more of those words.
+DROP_RARE = bool(os.environ.get("TARJUMAN_DROP_RARE"))
+
+
+def rare_classes(counts: dict) -> list:
+    """Class names with fewer than MIN_PER_CLASS samples, rarest first."""
+    return [n for n, c in sorted(counts.items(), key=lambda kv: kv[1])
+            if c < MIN_PER_CLASS]
 
 # Model hyper-parameters
 N_ESTIMATORS = 150
@@ -463,14 +482,24 @@ def preflight(csv_path: str) -> None:
         print("\n[FAIL] Dataset is empty.")
         sys.exit(1)
 
-    expected_cols = TOTAL_FEATURES + 1
-    if len(header) != expected_cols:
-        print(f"\n[FAIL] Column count mismatch: found {len(header)}, "
-              f"expected {expected_cols}.")
+    # كتلة السمات تُحدَّد بالاسم لا بالموضع: الملفّ اكتسب أعمدة وصفٍ في
+    # المقدّمة (signer، camera، session، recorded_at)، وكان فحصُ الطول
+    # المطلق يوقف التدريب كلّه لأجلها رغم أنّ السمات نفسها سليمة.
+    from tarjuman_core.dataset import FIRST_FEATURE_COLUMN
+    start = (header.index(FIRST_FEATURE_COLUMN)
+             if FIRST_FEATURE_COLUMN in header else 1)
+    found = len(header) - start
+    if found != TOTAL_FEATURES:
+        print(f"\n[FAIL] Feature count mismatch: found {found}, "
+              f"expected {TOTAL_FEATURES}.")
         print("       The dataset was recorded with a DIFFERENT feature layout.")
         print("       Re-record with the current code, or migrate the old file.")
         sys.exit(1)
-    print(f"   columns      : {len(header)}  (matches TOTAL_FEATURES) [OK]")
+    meta = header[1:start]
+    print(f"   columns      : {len(header)}  "
+          f"({found} features matches TOTAL_FEATURES) [OK]")
+    if meta:
+        print(f"   metadata     : {', '.join(meta)}  (skipped)")
 
     total = sum(counts.values())
     smallest = min(counts.values())
@@ -491,10 +520,27 @@ def preflight(csv_path: str) -> None:
         print("\n       Record a second term:  npm run collect")
         sys.exit(1)
 
-    if smallest < 5:
-        print(f"\n[FAIL] Smallest class has {smallest} sample(s).")
-        print("       The train/test split cannot be stratified below 5.")
-        sys.exit(1)
+    rare = rare_classes(counts)
+    if rare:
+        if not DROP_RARE:
+            print(f"\n[FAIL] Smallest class has {smallest} sample(s).")
+            print(f"       The train/test split cannot be stratified below "
+                  f"{MIN_PER_CLASS}.")
+            print(f"\n       Record more of: {', '.join(rare)}")
+            print("       Or train without them:  npm run trainstill -- "
+                  "--skip-extract --drop-rare")
+            sys.exit(1)
+        kept = len(counts) - len(rare)
+        held = sum(counts[n] for n in rare)
+        print(f"\n[DROP] --drop-rare: setting aside {len(rare)} word(s) with "
+              f"fewer than {MIN_PER_CLASS} samples:")
+        for n in rare:
+            print(f"          {n:<20s} {counts[n]:>4d}")
+        print(f"       Training on {kept} classes / {total - held} samples.")
+        print("       The dropped words will NOT be in labels.json - the model")
+        print("       cannot answer them. Record more, then train again.")
+        counts = {n: c for n, c in counts.items() if n not in rare}
+        smallest = min(counts.values())
 
     if smallest < 20:
         print(f"\n[WARN] Smallest class has only {smallest} samples "
@@ -560,17 +606,34 @@ def main():
 
     df = pd.read_csv(INPUT_CSV)
 
-    # Validate shape
-    expected_cols = TOTAL_FEATURES + 1      # label + 9 000 features
-    if df.shape[1] != expected_cols:
-        print(f"\n[WARN] Column count ({df.shape[1]}) != expected ({expected_cols}).")
+    # أوّل عمودٍ اسمه f0_v0 هو بداية السمات. ما قبله وصفٌ للتسجيلة
+    # (signer، camera، …) وليس رقماً — تمريره إلى النموذج كان سيُدخل نصّاً
+    # في مصفوفة الأعداد.
+    from tarjuman_core.dataset import FIRST_FEATURE_COLUMN
+    cols = list(df.columns)
+    start = cols.index(FIRST_FEATURE_COLUMN) if FIRST_FEATURE_COLUMN in cols else 1
+    if df.shape[1] - start != TOTAL_FEATURES:
+        print(f"\n[WARN] Feature count ({df.shape[1] - start}) "
+              f"!= expected ({TOTAL_FEATURES}).")
         print("       Continuing with the data as-is.")
 
-    labels_raw = df.iloc[:, 0].values       # first column  -> labels
-    features   = df.iloc[:, 1:].values      # remaining cols -> float features
+    if DROP_RARE:
+        # The same rule the pre-flight applied, applied to the rows themselves.
+        # Both sites read MIN_PER_CLASS, so they can never disagree about which
+        # words are in the model.
+        counts = df.iloc[:, 0].value_counts().to_dict()
+        rare = rare_classes(counts)
+        if rare:
+            df = df[~df.iloc[:, 0].isin(rare)].reset_index(drop=True)
+            print(f"   dropped      : {', '.join(rare)}  "
+                  f"(under {MIN_PER_CLASS} samples)")
+
+    labels_raw = df.iloc[:, 0].values          # first column -> labels
+    features   = df.iloc[:, start:].values     # feature block -> floats
 
     print(f"   samples      : {len(df):,}")
-    print(f"   columns      : {df.shape[1]:,}  (1 label + {df.shape[1] - 1} features)")
+    print(f"   columns      : {df.shape[1]:,}  "
+          f"({start} leading + {df.shape[1] - start} features)")
     print(f"   classes      : {np.unique(labels_raw).tolist()}")
 
     # -- Step 2: Encode labels -----------------------------------------------

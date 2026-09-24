@@ -316,23 +316,53 @@ class SmartCamera:
     # nothing to a landmark detector.
     BRIGHTNESS_MIN = float(os.getenv("CAMERA_BRIGHTNESS_MIN", "85"))
 
+    # -- Pi exposure bias -----------------------------------------------------
+    # libcamera's auto-exposure meters the WHOLE frame by default. With a lit
+    # wall or doorway behind the signer, that bright region dominates the
+    # average, the AE shortens the exposure to protect it, and the signer
+    # becomes a silhouette — a picture in which MediaPipe finds no hand at all.
+    #
+    # Two controls fix it, and neither costs frame rate:
+    #   metering mode : measure the CENTRE, where the signer is, instead of
+    #                   the whole frame. Applied always; see _tune_picamera_ae.
+    #   CAMERA_EV     : a stop or two of deliberate over-exposure on top.
+    #                   +1.0 doubles the target brightness, +2.0 quadruples it.
+    #                   Use it when centre metering alone is not enough.
+    PI_EXPOSURE_VALUE = float(os.getenv("CAMERA_EV", "0"))
+
     # Set CAMERA_FORCE_FPS=0 to switch the whole exposure-forcing search off
     # and simply leave the camera on auto-exposure.
     FORCE_FPS = os.getenv("CAMERA_FORCE_FPS", "1").strip().lower() not in (
         "0", "false", "no", "off")
 
     # -- Backend identifiers --------------------------------------------------
-    BACKEND_PICAMERA2 = "picamera2"
-    BACKEND_OPENCV    = "opencv"
-    BACKEND_NETWORK   = "network"      # DroidCam / IP Webcam / any MJPEG stream
-    BACKEND_USB_DSHOW = "usb_dshow"    # External USB camera using DSHOW
+    BACKEND_PICAMERA2  = "picamera2"
+    BACKEND_OPENCV     = "opencv"
+    BACKEND_NETWORK    = "network"         # DroidCam / IP Webcam / any MJPEG stream
+    BACKEND_USB_DSHOW  = "usb_dshow"       # External USB camera using DSHOW
+    BACKEND_SUBPROCESS = "picam_subprocess" # picam_server.py via system Python (Pi OS Trixie)
 
-    def __init__(self, device_index: int = 0, source=None):
+    def __init__(self, device_index: int = 0, source=None,
+                 width=None, height=None, fps=None, exposure_value=None):
         """
         Parameters
         ----------
         device_index : int
             Index passed to cv2.VideoCapture for a locally attached webcam.
+        width, height, fps, exposure_value : int | float | None
+            Override WIDTH / HEIGHT / FPS / PI_EXPOSURE_VALUE for THIS camera
+            only.
+
+            Those three are class attributes read from the environment when the
+            module is imported, which makes them impossible to change from a
+            command line: by the time `main()` parses argv, the class body has
+            already run. Assigning here creates INSTANCE attributes that shadow
+            the class ones, and since every use inside this class goes through
+            `self.`, the override reaches all of them without touching global
+            state or re-importing anything.
+
+            None means "leave it as the environment set it", so passing nothing
+            behaves exactly as before.
         source : str | int | None
             • None            -> auto-detect (Picamera2 on a Pi, else webcam)
             • "laptop"        -> force the local webcam
@@ -347,6 +377,16 @@ class SmartCamera:
         whole model is built from. Recording the dataset over DroidCam is a
         genuine quality win.
         """
+        # Per-instance overrides, applied before anything reads them.
+        if width is not None:
+            self.WIDTH = int(width)
+        if height is not None:
+            self.HEIGHT = int(height)
+        if fps is not None:
+            self.FPS = int(fps)
+        if exposure_value is not None:
+            self.PI_EXPOSURE_VALUE = float(exposure_value)
+
         self._device_index = device_index
         self._backend      = None   # Will be set during start()
         self._cam          = None   # Backend camera object
@@ -392,6 +432,14 @@ class SmartCamera:
                 # how the Pi records its dataset; see _start_picamera2.
                 self._requested_backend = self.BACKEND_PICAMERA2
                 self._explicit_picamera = True
+            elif source.lower() in ("picam_subprocess", "picam-subprocess",
+                                    "subprocess", "pi_subprocess"):
+                # picam_server.py via system Python — use when the venv's Python
+                # version is not the system Python (e.g. pyenv 3.12 on Trixie
+                # which ships 3.13). The server runs in system Python (which has
+                # picamera2) and streams raw BGR frames to this process via pipe.
+                self._requested_backend = self.BACKEND_SUBPROCESS
+                self._explicit_picamera = True
             elif source.lower() == "laptop":
                 self._requested_backend = self.BACKEND_OPENCV
             elif source.lower() == "usb_dshow":
@@ -428,6 +476,8 @@ class SmartCamera:
             self._start_network()
         elif self._requested_backend == self.BACKEND_PICAMERA2:
             self._start_picamera2()
+        elif self._requested_backend == self.BACKEND_SUBPROCESS:
+            self._start_subprocess()
         elif self._requested_backend == self.BACKEND_USB_DSHOW:
             self._start_usb_dshow()
         else:
@@ -873,6 +923,8 @@ class SmartCamera:
             return False, None
         if self._backend == self.BACKEND_PICAMERA2:
             return self._read_picamera2()
+        elif self._backend == self.BACKEND_SUBPROCESS:
+            return self._read_subprocess()
         elif self._backend == self.BACKEND_NETWORK:
             return self._read_network()
         return self._read_opencv()
@@ -913,6 +965,13 @@ class SmartCamera:
             if self._backend == self.BACKEND_PICAMERA2:
                 self._cam.stop()
                 print("[SmartCamera] Picamera2 stopped and released.")
+            elif self._backend == self.BACKEND_SUBPROCESS:
+                try:
+                    self._cam.terminate()
+                    self._cam.wait(timeout=2)
+                except Exception:
+                    pass
+                print("[SmartCamera] picam_server subprocess stopped.")
             elif self._backend == self.BACKEND_NETWORK:
                 self._cam.release()
                 print("[SmartCamera] Network stream closed.")
@@ -927,6 +986,77 @@ class SmartCamera:
             self._backend    = None
 
     # -- Picamera2 Backend ---------------------------------------------------
+
+    def _tune_picamera_ae(self, picam) -> None:
+        """
+        Point the Pi's auto-exposure at the signer, then check what it produced.
+
+        Why this exists at all: the USB path measures the picture and refuses an
+        exposure too dark to use (`_force_frame_rate` / `BRIGHTNESS_MIN`). The
+        Picamera2 path had no equivalent — it passed a frame rate and trusted
+        the result. So on the Pi, and only on the Pi, a black picture was
+        possible with nothing measuring it and nothing warning about it.
+
+        What it does NOT need to do is chase gain manually. libcamera's AE
+        already raises analogue gain on its own once it cannot lengthen the
+        exposure any further, which is exactly what `_brighten_without_exposure`
+        does by hand for UVC webcams. The gap here was never gain control — it
+        was that nobody looked at the result. So: aim the metering, apply any
+        requested bias, then measure and say what was found.
+        """
+        # -- aim the meter ----------------------------------------------------
+        try:
+            from libcamera import controls as _lc  # type: ignore[import]
+            metering = _lc.AeMeteringModeEnum.CentreWeighted
+        except Exception:
+            metering = 0        # libcamera's MeteringCentreWeighted
+        wanted = {"AeMeteringMode": metering}
+        if self.PI_EXPOSURE_VALUE:
+            wanted["ExposureValue"] = float(self.PI_EXPOSURE_VALUE)
+        try:
+            picam.set_controls(wanted)
+            note = "centre-weighted metering"
+            if self.PI_EXPOSURE_VALUE:
+                note += f", EV{self.PI_EXPOSURE_VALUE:+.1f}"
+            print(f"[SmartCamera] AE: {note}")
+        except Exception as exc:
+            print(f"[SmartCamera] [!] could not set AE controls ({exc}); "
+                  "leaving libcamera's defaults.")
+
+        # -- then look at what came out --------------------------------------
+        # AE needs a moment to settle; the first frames after start are not
+        # representative of anything.
+        bright, frames = 0.0, 0
+        try:
+            for _ in range(12):
+                frame = picam.capture_array()
+                if frame is not None:
+                    bright, frames = float(np.mean(frame)), frames + 1
+                time.sleep(0.04)
+        except Exception:
+            pass
+
+        if not frames:
+            print("[SmartCamera] [!] could not measure brightness.")
+            return
+
+        if bright >= self.BRIGHTNESS_MIN:
+            print(f"[SmartCamera] Brightness {bright:.0f}/255 — usable.")
+            return
+
+        print(f"[SmartCamera] [!] Brightness {bright:.0f}/255, below the "
+              f"{self.BRIGHTNESS_MIN:.0f} needed for reliable landmarks.")
+        print("[SmartCamera]     AE has already raised gain as far as it can; "
+              "what is left is:")
+        print("[SmartCamera]       1. MORE LIGHT, in FRONT of the signer. Fixes "
+              "brightness AND blur.")
+        print(f"[SmartCamera]       2. A longer exposure: --fps 30 doubles the "
+              f"time each frame\n"
+              f"[SmartCamera]          gets (currently capped at 1/{self.FPS:.0f} s).")
+        print("[SmartCamera]       3. CAMERA_EV=1.5 in .env to bias AE brighter "
+              "(costs noise).")
+        print("[SmartCamera]     Recording now will fail takes with "
+              "'a hand was seen in only N% of frames'.")
 
     def _pick_sensor_mode(self, picam):
         """
@@ -1047,6 +1177,92 @@ class SmartCamera:
             return Transform(hflip=1, vflip=1)
         return None
 
+    # -- Subprocess Backend (picam_server.py via system Python) ---------------
+
+    def _start_subprocess(self) -> None:
+        """
+        Spawn scripts/picam_server.py using the SYSTEM Python (python3).
+
+        This solves the Python version conflict on Raspberry Pi OS Trixie:
+          • System Python 3.13 has picamera2 (apt-installed, C extension).
+          • The venv uses Python 3.12 (pyenv) because mediapipe needs ≤3.12.
+          • picamera2's C extension (_libcamera.so) is compiled for 3.13 and
+            cannot be loaded into a 3.12 interpreter — not even via .pth tricks.
+
+        Solution: spawn the server as a child process using `python3` (3.13),
+        which CAN import picamera2. The server writes raw BGR24 frames to stdout;
+        this process reads them, reshapes them to numpy arrays, and hands them to
+        the rest of the pipeline exactly as any other backend would.
+
+        No format conversion, no GStreamer, no v4l2loopback — just a pipe.
+        """
+        import subprocess
+        import pathlib
+
+        # Locate picam_server.py — works whether tarjuman_core lives under
+        # src/ (laptop) or directly in the project root (Pi).
+        here   = pathlib.Path(__file__).resolve().parent          # tarjuman_core/
+        candidates = [
+            here.parent.parent / "scripts" / "picam_server.py",  # src/tarjuman_core/ -> ../../scripts/
+            here.parent / "scripts" / "picam_server.py",         # tarjuman_core/     -> ../scripts/
+            here / "picam_server.py",                            # inside tarjuman_core/ itself
+            here.parent.parent / "picam_server.py",              # project root (src layout)
+            here.parent / "picam_server.py",                     # project root (flat layout)
+        ]
+        script = next((c for c in candidates if c.exists()), None)
+        if script is None:
+            print(f"[SmartCamera] [FAIL] picam_server.py not found at {script}")
+            print("[SmartCamera] Copy scripts/picam_server.py to the Pi first.")
+            return
+
+        cmd = ["python3", str(script),
+               str(self.WIDTH), str(self.HEIGHT), str(self.FPS)]
+        print(f"[SmartCamera] Starting subprocess backend: {' '.join(cmd)}")
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=None,   # let stderr through so the user sees server logs
+                bufsize=0,
+            )
+        except Exception as exc:
+            print(f"[SmartCamera] [FAIL] Could not start picam_server: {exc}")
+            return
+
+        # Give the server a moment to start streaming
+        time.sleep(2.5)
+        if proc.poll() is not None:
+            print("[SmartCamera] [FAIL] picam_server.py exited immediately. "
+                  "Check that system python3 can import picamera2.")
+            return
+
+        self._cam     = proc
+        self._backend = self.BACKEND_SUBPROCESS
+        self._sub_frame_bytes = self.WIDTH * self.HEIGHT * 3  # BGR24
+        print(f"[SmartCamera] Subprocess backend running (BGR24 "
+              f"{self.WIDTH}x{self.HEIGHT}).")
+
+    def _read_subprocess(self):
+        """Read one raw BGR frame from the picam_server subprocess pipe."""
+        proc = self._cam
+        if proc is None or proc.poll() is not None:
+            return False, None
+        try:
+            raw = b""
+            needed = self._sub_frame_bytes
+            while len(raw) < needed:
+                chunk = proc.stdout.read(needed - len(raw))
+                if not chunk:
+                    return False, None
+                raw += chunk
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape(
+                self.HEIGHT, self.WIDTH, 3
+            ).copy()   # .copy() so the array is writeable
+            return True, frame
+        except Exception as exc:
+            print(f"[SmartCamera] subprocess read error: {exc}")
+            return False, None
+
     def _start_picamera2(self) -> None:
         """
         Start the CSI-attached Raspberry Pi camera (Module 3 and friends).
@@ -1143,6 +1359,8 @@ class SmartCamera:
                 focus_note = f"LensPosition={self.LENS_POSITION} (manual focus)"
             except Exception:
                 pass
+
+            self._tune_picamera_ae(picam)
 
             self._cam     = picam
             self._backend = self.BACKEND_PICAMERA2
